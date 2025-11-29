@@ -5,3 +5,4 @@ sentence-transformers==2.7.0
 numpy==1.26.4
 openai>=1.40.0
 python-dotenv
+pandas
