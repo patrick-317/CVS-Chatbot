@@ -1,5 +1,7 @@
 from fastapi import FastAPI
 from app.routers import recommendation_controller
+from dotenv import load_dotenv
+load_dotenv()
 
 app = FastAPI(title="CVS Honey Combo Chatbot API")
 
