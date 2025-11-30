@@ -1,75 +1,58 @@
-import os
-import re
+from __future__ import annotations
+
 import json
-from typing import List, Dict, Any, Optional
+import math
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 from openai import OpenAI
 
-# =====================================================================
-# 경로 설정
-# =====================================================================
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
-COMBINATION_PATH = os.path.join(BASE_DIR, "combination.csv")
-SYNTHETIC_PATH = os.path.join(BASE_DIR, "synthetic_honey_combos_1000.csv")
-CU_PRODUCTS_PATH = os.path.join(BASE_DIR, "cu_official_products.csv")
+# ------------------------
+# 전역 설정 & 캐시
+# ------------------------
 
-PRECOMPUTED_DIR = os.path.join(BASE_DIR, "precomputed")
-COMBO_EMBEDDINGS_PATH = os.path.join(PRECOMPUTED_DIR, "combo_embeddings.npy")
-COMBO_DOCS_PATH = os.path.join(PRECOMPUTED_DIR, "combo_docs.json")
+BASE_DIR = Path.cwd()
+DATA_DIR = BASE_DIR / "data"
+PRECOMP_DIR = BASE_DIR / "precomputed"
+PRECOMP_DIR.mkdir(exist_ok=True)
 
-# =====================================================================
-# 전역 캐시
-# =====================================================================
-_comb_df: Optional[pd.DataFrame] = None
-_syn_df: Optional[pd.DataFrame] = None
-_cu_df: Optional[pd.DataFrame] = None
-_combo_df: Optional[pd.DataFrame] = None
+COMBO_CSV_CANDIDATES = [
+    DATA_DIR / "combination.csv",
+    BASE_DIR / "combination.csv",
+    ]
+SYN_CSV_CANDIDATES = [
+    DATA_DIR / "synthetic_honey_combos_1000.csv",
+    BASE_DIR / "synthetic_honey_combos_1000.csv",
+    ]
+PRODUCT_CSV_CANDIDATES = [
+    DATA_DIR / "cu_official_products.csv",
+    BASE_DIR / "cu_official_products.csv",
+    ]
 
-_keyword_dict: Optional[Dict[str, set]] = None
+DOCS_JSON_PATH = PRECOMP_DIR / "combo_docs.json"
+EMBED_NPY_PATH = PRECOMP_DIR / "combo_embeddings.npy"
 
 _openai_client: Optional[OpenAI] = None
-_openai_embedding_model: str = "text-embedding-3-small"
-
-_combo_embeddings: Optional[np.ndarray] = None  # N x d
-
-# =====================================================================
-# 🔹 카테고리 추론용 키워드 (컨트롤러에서 사용)
-# =====================================================================
-CATEGORY_KEYWORDS = {
-    "라면/분식": ["라면", "컵라면", "국물라면", "떡볶이", "분식", "우동", "튀김", "어묵"],
-    "식사류": ["밥", "식사", "도시락", "덮밥", "카레", "죽", "파스타", "볶음밥"],
-    "간편식": ["삼각김밥", "주먹밥", "햄버거", "샌드위치", "핫도그", "토스트"],
-    "디저트": ["빵", "케이크", "쿠키", "초코", "젤리", "아이스크림", "빙수", "달달", "달콤"],
-    "술안주/야식": ["맥주", "소주", "와인", "안주", "야식", "치킨", "포차", "편맥"],
-}
+_combo_docs: Optional[List[Dict]] = None
+_combo_embeddings: Optional[np.ndarray] = None
+_df_combo: Optional[pd.DataFrame] = None
+_df_syn: Optional[pd.DataFrame] = None
+_df_products: Optional[pd.DataFrame] = None
 
 
-def infer_category_from_text(text: str) -> str:
-    """사용자 문장에서 대략적인 카테고리 추론 (quickReplies용)"""
-    if not text:
-        return ""
+# ------------------------
+# 유틸
+# ------------------------
 
-    low = text.lower()
-    best_cat = ""
-    best_score = 0
-
-    for cat, kws in CATEGORY_KEYWORDS.items():
-        score = 0
-        for kw in kws:
-            if kw in text or kw in low:
-                score += 1
-        if score > best_score:
-            best_cat = cat
-            best_score = score
-
-    return best_cat
+def _resolve_first_existing(paths: List[Path]) -> Path:
+    for p in paths:
+        if p.is_file():
+            return p
+    raise FileNotFoundError(f"파일을 찾을 수 없습니다: {[str(p) for p in paths]}")
 
 
-# =====================================================================
-# OpenAI client
-# =====================================================================
 def _get_openai_client() -> OpenAI:
     global _openai_client
     if _openai_client is None:
@@ -77,351 +60,290 @@ def _get_openai_client() -> OpenAI:
     return _openai_client
 
 
-# =====================================================================
-# 텍스트 전처리
-# =====================================================================
-def _clean_text(text: str) -> str:
-    if not isinstance(text, str):
-        return ""
-    t = re.sub(r"\(.*?\)", "", text)
-    t = re.sub(r"[^0-9a-zA-Z가-힣]", "", t)
-    return t.lower()
-
-
-# =====================================================================
-# 데이터 로딩
-# =====================================================================
-def _load_data():
-    global _comb_df, _syn_df, _cu_df, _combo_df, _keyword_dict
-
-    if _combo_df is not None:
-        return
-
-    _comb_df = pd.read_csv(COMBINATION_PATH)
-    _syn_df = pd.read_csv(SYNTHETIC_PATH)
-    _cu_df = pd.read_csv(CU_PRODUCTS_PATH)
-
-    _comb_df["source"] = "real"
-    _syn_df["source"] = "synthetic"
-
-    _combo_df = pd.concat([_comb_df, _syn_df], ignore_index=True)
-
-    for col in ["조합 이름", "주요 상품", "보조 상품(들)", "키워드 / 상황", "카테고리", "source"]:
-        if col in _combo_df.columns:
-            _combo_df[col] = _combo_df[col].fillna("")
-
-    if "clean_name" not in _cu_df.columns:
-        _cu_df["clean_name"] = _cu_df["name"].apply(_clean_text)
-
-    _keyword_dict = _build_keyword_dict()
-
-
-def _build_keyword_dict() -> Dict[str, set]:
-    global _combo_df
-    d: Dict[str, set] = {}
-    for val in _combo_df["키워드 / 상황"]:
-        if not isinstance(val, str):
-            continue
-
-        parts = re.split(r"[;,]", val)
-        for p in parts:
-            p = p.strip()
-            if not p:
-                continue
-
-            low = p.lower()
-            compact = low.replace(" ", "")
-            for k in {low, compact}:
-                d.setdefault(k, set()).add(p)
-    return d
-
-
-# =====================================================================
-# RAG 기반: 각 조합이 왜 좋은지 한 줄 설명 생성 (오프라인용)
-# =====================================================================
-def _rag_extract_combo_features(row: pd.Series) -> str:
-    prompt = f"""
-    아래 편의점 꿀조합이 왜 좋은 조합인지 설명해줘.
-    '맛 조화(매운/단/짠/고소)', '식감 대비(바삭/쫀득/부드러움)', 
-    '온도 대비(뜨거움+차가움)', '중화/밸런스(매운맛+치즈, 짠맛+단맛)', 
-    '포만감', '상황(야식/다이어트/간편식)' 관점에서 1~2문장으로 요약해줘.
-
-    주요상품: {row['주요 상품']}
-    보조상품: {row['보조 상품(들)']}
-    상황/키워드: {row['키워드 / 상황']}
-    """
-    resp = _get_openai_client().chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.4,
-    )
-    return resp.choices[0].message.content.strip()
-
-
-# =====================================================================
-# B안 핵심: 임베딩을 미리 계산해서 파일로 저장 (한 번만 실행)
-# =====================================================================
-def build_precomputed_embeddings():
-    _load_data()
-
-    os.makedirs(PRECOMPUTED_DIR, exist_ok=True)
-
-    docs: List[str] = []
-    print(f"[build_precomputed_embeddings] 총 {_combo_df.shape[0]} 개 조합 처리 중...")
-
-    for _, row in _combo_df.iterrows():
-        try:
-            reason = _rag_extract_combo_features(row)
-        except Exception:
-            # 실패 시 이유 없이도 진행
-            reason = ""
-
-        doc = " / ".join(
-            [
-                f"조합 이름: {row['조합 이름']}",
-                f"주요 상품: {row['주요 상품']}",
-                f"보조 상품: {row['보조 상품(들)']}",
-                f"상황: {row['키워드 / 상황']}",
-                f"카테고리: {row['카테고리']}",
-                f"이유: {reason}",
-            ]
-        )
-        docs.append(doc)
-
-    # 임베딩 계산
-    client = _get_openai_client()
-    embeddings: List[List[float]] = []
-    batch_size = 100
-
-    for i in range(0, len(docs), batch_size):
-        chunk = docs[i : i + batch_size]
-        resp = client.embeddings.create(
-            model=_openai_embedding_model,
-            input=chunk,
-        )
-        for d in resp.data:
-            embeddings.append(d.embedding)
-
-    arr = np.array(embeddings, dtype="float32")
-    norms = np.linalg.norm(arr, axis=1, keepdims=True) + 1e-10
-    arr = arr / norms
-
-    np.save(COMBO_EMBEDDINGS_PATH, arr)
-
-    with open(COMBO_DOCS_PATH, "w", encoding="utf-8") as f:
-        json.dump(docs, f, ensure_ascii=False, indent=2)
-
-    print(f"[build_precomputed_embeddings] 저장 완료: {COMBO_EMBEDDINGS_PATH}")
-
-
-# =====================================================================
-# 서버에서 사용하는 임베딩 로더 (빠른 경로)
-# =====================================================================
-def _load_semantic_index():
-    global _combo_embeddings
-    _load_data()
-
-    if _combo_embeddings is not None:
-        return
-
-    if os.path.exists(COMBO_EMBEDDINGS_PATH):
-        arr = np.load(COMBO_EMBEDDINGS_PATH)
-        _combo_embeddings = arr.astype("float32")
-        return
-
-    # 🔻 fallback: RAG 이유 없이 간단 텍스트로 임베딩 생성 (최초 1회)
-    client = _get_openai_client()
-    docs: List[str] = []
-    for _, row in _combo_df.iterrows():
-        doc = " / ".join(
-            [
-                f"조합 이름: {row['조합 이름']}",
-                f"주요 상품: {row['주요 상품']}",
-                f"보조 상품: {row['보조 상품(들)']}",
-                f"상황: {row['키워드 / 상황']}",
-                f"카테고리: {row['카테고리']}",
-            ]
-        )
-        docs.append(doc)
-
-    embeddings: List[List[float]] = []
-    batch_size = 100
-    for i in range(0, len(docs), batch_size):
-        chunk = docs[i : i + batch_size]
-        resp = client.embeddings.create(
-            model=_openai_embedding_model,
-            input=chunk,
-        )
-        for d in resp.data:
-            embeddings.append(d.embedding)
-
-    arr = np.array(embeddings, dtype="float32")
-    norms = np.linalg.norm(arr, axis=1, keepdims=True) + 1e-10
-    arr = arr / norms
-
-    _combo_embeddings = arr
-    # 원하면 여기서도 npy로 저장 가능
-    os.makedirs(PRECOMPUTED_DIR, exist_ok=True)
-    np.save(COMBO_EMBEDDINGS_PATH, arr)
-
-
-# =====================================================================
-# 키워드 추출
-# =====================================================================
-def extract_keywords(text: str) -> List[str]:
-    raw = text.lower()
-    compact = re.sub(r"[^0-9a-zA-Z가-힣]", "", raw)
-
-    found = set()
-    for trig, concept_set in _keyword_dict.items():
-        if trig in compact:
-            found |= concept_set
-
-    if not found:
-        parts = re.split(r"\s+|[,./!?]", raw)
-        found = {p for p in parts if len(p) >= 2}
-
-    return list(found)
-
-
-# =====================================================================
-# CU 상품 매칭 (비식품 필터)
-# =====================================================================
-def _is_food_product(row: pd.Series) -> bool:
-    name = str(row.get("name", "")).lower()
-    non_food = ["우산", "이어폰", "충전", "usb", "라이터", "물티슈", "건전지"]
-    for n in non_food:
-        if n in name:
-            return False
-    return True
-
-
-def _find_cu_products(row: pd.Series, max_items: int = 3) -> List[str]:
-    global _cu_df
-    _load_data()
-
-    combo_items = f"{row['주요 상품']},{row['보조 상품(들)']}"
-    parts = re.split(r"[,+/·]|외", combo_items)
-
-    results: List[str] = []
-
-    for item in parts:
-        item = item.strip()
-        if not item:
-            continue
-
-        clean = _clean_text(item)
-        best = None
-        best_score = 0
-
-        for _, cu in _cu_df.iterrows():
-            cu_clean = cu["clean_name"]
-            score = 0
-            if clean and clean in cu_clean:
-                score = len(clean)
-            elif cu_clean and cu_clean in clean:
-                score = len(cu_clean)
-
-            if score > best_score:
-                best_score = score
-                best = cu["name"]
-
-        if not best:
-            continue
-
-        cu_row = _cu_df[_cu_df["name"] == best]
-        if cu_row.empty or not _is_food_product(cu_row.iloc[0]):
-            continue
-
-        if best not in results:
-            results.append(best)
-
-        if len(results) >= max_items:
-            break
-
-    return results
-
-
-# =====================================================================
-# 🔥 최종 추천 함수 — 컨트롤러에서 호출
-# =====================================================================
-def recommend_combos_openai_rag(user_text: str, top_k: int = 3) -> List[Dict[str, Any]]:
-    global _combo_embeddings, _combo_df
-
-    _load_data()
-    _load_semantic_index()
-
-    if not user_text:
-        user_text = "아무거나 추천해줘"
-
-    client = _get_openai_client()
-
-    # 1) 사용자 문장 임베딩 (한 번)
-    resp = client.embeddings.create(
-        model=_openai_embedding_model,
-        input=[user_text],
-    )
-    q = np.array(resp.data[0].embedding, dtype="float32")
-    q = q / (np.linalg.norm(q) + 1e-10)
-
-    # 2) 코사인 유사도
-    sims = _combo_embeddings @ q
-
-    # 3) 키워드 기반 스코어
-    keywords = extract_keywords(user_text)
-    kw_scores = []
-    for _, row in _combo_df.iterrows():
-        txt = " ".join(
-            [
-                row["조합 이름"],
-                row["주요 상품"],
-                row["보조 상품(들)"],
-                row["키워드 / 상황"],
-                row["카테고리"],
-            ]
-        ).lower()
-        score = sum(1 for kw in keywords if kw.lower() in txt)
-        kw_scores.append(score)
-
-    kw_scores = np.array(kw_scores, dtype="float32")
-    if kw_scores.max() > 0:
-        kw_scores /= (kw_scores.max() + 1e-10)
-
-    # 4) 실제 꿀조합(real) 보너스
-    is_real = (_combo_df["source"] == "real").astype("float32").to_numpy()
-
-    # 5) 최종 점수
-    final = 0.75 * sims + 0.20 * kw_scores + 0.05 * is_real
-
-    ordered = list(np.argsort(-final))
-
-    kw_preview = ", ".join(keywords[:3]) if keywords else user_text[:20]
-
-    results: List[Dict[str, Any]] = []
-
-    for idx in ordered:
-        row = _combo_df.iloc[idx]
-        items = _find_cu_products(row, max_items=3)
-        if len(items) < 2:
-            continue
-
-        reason = (
-            "입력하신 문장의 의미를 임베딩으로 분석해서 "
-            f"가장 비슷한 분위기의 꿀조합을 골랐어요. (기준: '{kw_preview}')"
-        )
-        if row["source"] == "real":
-            reason += "\n실제로 많이 알려진 꿀조합이라서 우선적으로 추천했어요."
-
-        results.append(
+def _parse_price(v) -> Optional[int]:
+    if v is None or (isinstance(v, float) and math.isnan(v)):
+        return None
+    s = str(v)
+    digits = "".join(ch for ch in s if ch.isdigit())
+    return int(digits) if digits else None
+
+
+def _load_dataframes() -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    global _df_combo, _df_syn, _df_products
+
+    if _df_combo is not None and _df_syn is not None and _df_products is not None:
+        return _df_combo, _df_syn, _df_products
+
+    combo_path = _resolve_first_existing(COMBO_CSV_CANDIDATES)
+    syn_path = _resolve_first_existing(SYN_CSV_CANDIDATES)
+    prod_path = _resolve_first_existing(PRODUCT_CSV_CANDIDATES)
+
+    _df_combo = pd.read_csv(combo_path, encoding="utf-8-sig")
+    _df_syn = pd.read_csv(syn_path, encoding="utf-8-sig")
+    _df_products = pd.read_csv(prod_path, encoding="utf-8-sig")
+
+    # 가격 정규화
+    _df_products["price_int"] = _df_products["price"].apply(_parse_price)
+
+    return _df_combo, _df_syn, _df_products
+
+
+def _find_price(product_name: str, df_products: pd.DataFrame) -> Optional[int]:
+    if not product_name:
+        return None
+
+    # 1차: 완전 일치
+    exact = df_products.loc[df_products["name"] == product_name]
+    if not exact.empty:
+        return _parse_price(exact.iloc[0]["price"])
+
+    # 2차: 부분 일치 (regex 사용 X)
+    contains = df_products[
+        df_products["name"].str.contains(product_name, na=False, regex=False)
+    ]
+    if not contains.empty:
+        return _parse_price(contains.iloc[0]["price"])
+
+    return None
+
+
+
+# ------------------------
+# 콤보 문서 구축
+# ------------------------
+
+def _build_combo_docs() -> List[Dict]:
+    df_combo, df_syn, df_products = _load_dataframes()
+
+    # 원본 + synthetic 합치기
+    df_all = pd.concat([df_combo, df_syn], ignore_index=True)
+
+    docs: List[Dict] = []
+    for idx, row in df_all.iterrows():
+        name = str(row.get("조합 이름", "")).strip() or f"꿀조합 {idx}"
+        store = str(row.get("편의점", "")).strip()
+        main_item = str(row.get("주요 상품", "")).strip()
+        extra_items_raw = str(row.get("보조 상품(들)", "")).strip()
+        keywords = str(row.get("키워드 / 상황", "")).strip()
+        category = str(row.get("카테고리", "")).strip() or "기타"
+
+        # 보조 상품 파싱 (쉼표 기준)
+        extra_items: List[str] = []
+        if extra_items_raw:
+            extra_items = [x.strip() for x in extra_items_raw.split(",") if x.strip()]
+
+        all_item_names: List[str] = []
+        if main_item:
+            all_item_names.append(main_item)
+        all_item_names.extend(extra_items)
+
+        item_entries: List[Dict] = []
+        total_price: Optional[int] = 0
+        any_price = False
+
+        for pname in all_item_names:
+            price = _find_price(pname, df_products)
+            if price is not None:
+                any_price = True
+                total_price = (total_price or 0) + price
+            item_entries.append(
+                {
+                    "name": pname,
+                    "price": price,
+                }
+            )
+
+        if not any_price:
+            total_price = None
+
+        doc_text_parts = [
+            name,
+            f"카테고리: {category}",
+            f"상황: {keywords}" if keywords else "",
+            f"주요 상품: {main_item}" if main_item else "",
+            f"보조 상품: {extra_items_raw}" if extra_items_raw else "",
+        ]
+        doc_text = " / ".join(part for part in doc_text_parts if part)
+
+        docs.append(
             {
-                "name": row["조합 이름"],
-                "category": row["카테고리"],
-                "reason": reason,
-                "items": items,
+                "id": int(idx),
+                "name": name,
+                "store": store,
+                "category": category,
+                "keywords": keywords,
+                "main_item": main_item,
+                "extra_items": extra_items,
+                "items": item_entries,      # ← 상품명 + 개별 가격
+                "total_price": total_price,  # ← 총합 가격
+                "doc_text": doc_text,        # ← 임베딩용 텍스트
             }
         )
 
-        if len(results) >= top_k:
-            break
+    return docs
+
+
+# ------------------------
+# 임베딩 사전 계산
+# ------------------------
+
+def build_precomputed_embeddings() -> None:
+    """
+    combo_docs.json + combo_embeddings.npy 생성용 스크립트 함수.
+    """
+    global _combo_docs, _combo_embeddings
+
+    client = _get_openai_client()
+    docs = _build_combo_docs()
+    print(f"[build_precomputed_embeddings] 총 {len(docs)} 개 조합 처리 중...")
+
+    texts = [d["doc_text"] for d in docs]
+    embeddings: List[List[float]] = []
+
+    batch_size = 128
+    for i in range(0, len(texts), batch_size):
+        batch = texts[i: i + batch_size]
+        resp = client.embeddings.create(
+            model="text-embedding-3-small",
+            input=batch,
+        )
+        for e in resp.data:
+            embeddings.append(e.embedding)
+
+    _combo_docs = docs
+    _combo_embeddings = np.array(embeddings, dtype="float32")
+
+    PRECOMP_DIR.mkdir(exist_ok=True)
+    with open(DOCS_JSON_PATH, "w", encoding="utf-8") as f:
+        json.dump(docs, f, ensure_ascii=False, indent=2)
+    np.save(EMBED_NPY_PATH, _combo_embeddings)
+
+    print("[build_precomputed_embeddings] 저장 완료:", DOCS_JSON_PATH, EMBED_NPY_PATH)
+
+
+# ------------------------
+# 런타임 로더
+# ------------------------
+
+def _load_semantic_index() -> Tuple[List[Dict], np.ndarray]:
+    global _combo_docs, _combo_embeddings
+
+    if _combo_docs is not None and _combo_embeddings is not None:
+        return _combo_docs, _combo_embeddings
+
+    if DOCS_JSON_PATH.is_file() and EMBED_NPY_PATH.is_file():
+        with open(DOCS_JSON_PATH, "r", encoding="utf-8") as f:
+            _combo_docs = json.load(f)
+        _combo_embeddings = np.load(EMBED_NPY_PATH)
+        return _combo_docs, _combo_embeddings
+
+    # 사전 계산 파일이 없으면 즉석 생성
+    build_precomputed_embeddings()
+    return _combo_docs, _combo_embeddings
+
+
+# ------------------------
+# 카테고리 키워드 매핑 (간단 버전)
+# ------------------------
+
+CATEGORY_KEYWORDS: Dict[str, List[str]] = {
+    "라면/분식": ["라면", "컵라면", "국물라면", "떡볶이", "분식", "우동", "튀김", "어묵"],
+    "식사류": ["밥", "식사", "도시락", "김치찌개", "덮밥", "카레", "죽", "파스타", "볶음밥"],
+    "간편식": ["삼각김밥", "주먹밥", "햄버거", "샌드위치", "핫도그", "토스트"],
+    "디저트": [
+        "디저트",
+        "빵",
+        "케이크",
+        "쿠키",
+        "초콜릿",
+        "젤리",
+        "아이스크림",
+        "빙수",
+        "달달",
+        "달콤",
+        "달다",
+    ],
+    "술안주/야식": [
+        "맥주",
+        "소주",
+        "와인",
+        "안주",
+        "야식",
+        "치킨",
+        "족발",
+        "포차",
+        "편맥",
+        "편의점맥주",
+    ],
+}
+
+
+def infer_category_from_text(text: str) -> Optional[str]:
+    text = text or ""
+    best_cat = None
+    best_score = 0
+    for cat, keywords in CATEGORY_KEYWORDS.items():
+        score = sum(1 for kw in keywords if kw in text)
+        if score > best_score:
+            best_score = score
+            best_cat = cat
+    return best_cat
+
+
+# ------------------------
+# 추천 메인 함수
+# ------------------------
+
+def recommend_combos_openai_rag(user_text: str, top_k: int = 3) -> List[Dict]:
+    """
+    user_text 를 임베딩해서 combo_docs 와의 코사인 유사도로 top_k 추천.
+    """
+    docs, combo_embeds = _load_semantic_index()
+    if not docs or combo_embeds is None or len(combo_embeds) == 0:
+        return []
+
+    client = _get_openai_client()
+    q_resp = client.embeddings.create(
+        model="text-embedding-3-small",
+        input=[user_text],
+    )
+    q_vec = np.array(q_resp.data[0].embedding, dtype="float32")
+
+    # 코사인 유사도
+    doc_norms = np.linalg.norm(combo_embeds, axis=1, keepdims=True)
+    q_norm = np.linalg.norm(q_vec)
+    if q_norm == 0 or np.any(doc_norms == 0):
+        sims = combo_embeds @ q_vec
+    else:
+        sims = (combo_embeds @ q_vec) / (doc_norms.flatten() * q_norm)
+
+    top_k = max(1, min(top_k, len(docs)))
+    top_indices = np.argsort(-sims)[:top_k]
+
+    results: List[Dict] = []
+    for idx in top_indices:
+        doc = docs[int(idx)]
+        total_price = doc.get("total_price")
+
+        price_line = ""
+        if isinstance(total_price, (int, float)):
+            price_line = f"이 조합을 모두 담으면 대략 {total_price:,}원 정도예요."
+
+        reason_lines = [
+            f"입력하신 문장의 의미를 임베딩으로 분석해서 가장 비슷한 분위기의 꿀조합을 골랐어요. (기준: '{user_text}')",
+        ]
+        if doc.get("keywords"):
+            reason_lines.append(f"이 조합은 '{doc['keywords']}' 상황에 잘 어울려요.")
+        if price_line:
+            reason_lines.append(price_line)
+
+        result = {
+            "name": doc.get("name", "편의점 꿀조합"),
+            "category": doc.get("category", "기타"),
+            "items": doc.get("items", []),
+            "total_price": total_price,
+            "reason": "\n\n".join(reason_lines),
+        }
+        results.append(result)
 
     return results

@@ -1,3 +1,5 @@
+from typing import List
+
 from fastapi import APIRouter
 
 from app.schemas.recommendation_model import (
@@ -22,30 +24,30 @@ def _build_item_card_from_result(result: dict) -> ItemCard:
     """
     recommendation_service 가 반환하는 1개 결과(dict)를
     Kakao ItemCard 형태로 변환.
-    result 예시:
-    {
-        "name": "라면 + 삼각김밥",
-        "category": "라면/분식",
-        "reason": "...",
-        "items": ["진라면 매운맛", "참치마요 삼각김밥"]
-    }
     """
     combo_name = result.get("name", "편의점 꿀조합")
     category = result.get("category", "")
-    reason = result.get("reason", "")
     items = result.get("items", [])
 
     head = ItemCardHead(
-        title=f"{combo_name}",
+        title=combo_name,
         description=f"카테고리: {category}" if category else None,
     )
 
-    item_list: list[ListItem] = []
-    for i, item_name in enumerate(items, start=1):
+    item_list: List[ListItem] = []
+    for i, item in enumerate(items, start=1):
+        # dict 형태(이름 + 가격)와 문자열 둘 다 지원
+        if isinstance(item, dict):
+            title_name = item.get("name") or "상품"
+            price = item.get("price")
+            desc = f"{price:,}원" if isinstance(price, (int, float)) else ""
+        else:
+            title_name = str(item)
+            desc = ""
         item_list.append(
             ListItem(
-                title=f"{i}. {item_name}",
-                description="",
+                title=f"{i}. {title_name}",
+                description=desc,
                 imageUrl=None,
             )
         )
@@ -88,7 +90,6 @@ def _build_quick_replies(user_text: str) -> list[dict]:
         },
     ]
 
-    # 첫 번째 버튼 라벨에 추론 카테고리 힌트 주기
     base[0]["label"] = f"{inferred} 말고 다른 거"
     return base
 
@@ -99,11 +100,15 @@ def _build_quick_replies(user_text: str) -> list[dict]:
     response_model_exclude_none=True,
 )
 def kakao_recommend_combo(request: KakaoSkillRequest):
+    """
+    오픈빌더에서 들어온 사용자 발화를 기반으로
+    RAG 추천 결과를 Kakao Skill JSON 으로 반환.
+    """
     user_text = request.userRequest.utterance or ""
     if not user_text:
         user_text = "아무거나 추천해줘"
 
-    # 추천 로직 호출
+    # 1) 추천 로직 호출
     results = recommend_combos_openai_rag(user_text, top_k=3)
 
     # 추천이 하나도 없을 때: simpleText 로 안내
@@ -121,7 +126,7 @@ def kakao_recommend_combo(request: KakaoSkillRequest):
     main = results[0]
     item_card = _build_item_card_from_result(main)
 
-    # 부가 설명 텍스트
+    # 부가 설명 텍스트 (다른 후보들)
     other_lines = []
     for sub in results[1:]:
         other_lines.append(f"- {sub.get('name', '')} ({sub.get('category', '')})")
