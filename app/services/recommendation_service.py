@@ -1,419 +1,509 @@
-import json
 import os
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+import re
+import json
+from difflib import SequenceMatcher
+from typing import List, Dict, Tuple, Optional
 
 import numpy as np
 import pandas as pd
 from openai import OpenAI
 
-# =========================
-# 경로 / 전역 변수
-# =========================
 
-BASE_DIR = Path(__file__).resolve().parents[2]
+# ---------- 전역 캐시 ----------
 
-DATA_DIR = BASE_DIR / "data"
-PRECOMPUTED_DIR = BASE_DIR / "precomputed"
-PRECOMPUTED_DIR.mkdir(parents=True, exist_ok=True)
-
-COMBINATION_CSV = DATA_DIR / "combination.csv"
-SYNTHETIC_CSV = DATA_DIR / "synthetic_honey_combos_1000.csv"
-PRODUCTS_CSV = DATA_DIR / "cu_official_products.csv"
-
-PRECOMP_DOCS_JSON = PRECOMPUTED_DIR / "combo_docs.json"
-PRECOMP_EMB_NPY = PRECOMPUTED_DIR / "combo_embeddings.npy"
-
-EMBED_MODEL = "text-embedding-3-small"
-
-_openai_client: Optional[OpenAI] = None
-_combo_docs: Optional[List[Dict[str, Any]]] = None
+_combo_docs: Optional[List[dict]] = None
 _combo_embeddings: Optional[np.ndarray] = None
-_products_df: Optional[pd.DataFrame] = None
+_openai_client: Optional[OpenAI] = None
 
-# =========================
-# OpenAI 클라이언트
-# =========================
 
+def _json_default(o):
+    """
+    json.dump 에서 numpy 타입 등을 파이썬 기본 타입으로 변환하기 위한 헬퍼
+    """
+    import numpy as np
+
+    if isinstance(o, (np.integer, np.floating)):
+        return o.item()  # numpy -> python int/float
+    return str(o)
+
+
+# ---------- OpenAI 클라이언트 ----------
 
 def _get_openai_client() -> OpenAI:
     global _openai_client
     if _openai_client is None:
-        # OPENAI_API_KEY 는 .env / 환경변수에 세팅되어 있다고 가정
         _openai_client = OpenAI()
     return _openai_client
 
 
-# =========================
-# 데이터 로딩
-# =========================
+EMBEDDING_MODEL = "text-embedding-3-small"
 
 
-def _load_csv(path: Path) -> Optional[pd.DataFrame]:
-    if not path.exists():
+# ---------- 유틸 ----------
+
+def _normalize_text(s: str) -> str:
+    """이름 매칭용 간단 정규화 (공백/특수문자 제거 + 소문자)."""
+    if not isinstance(s, str):
+        s = str(s) if s is not None else ""
+    s = re.sub(r"[\s\(\)\[\]\{\}\/\-\+·…·.,'\"!?]", "", s)
+    return s.lower()
+
+
+def _safe_int(value) -> Optional[int]:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return int(value)
+    s = str(value)
+    # 숫자/콤마 외 제거
+    s = re.sub(r"[^0-9]", "", s)
+    if not s:
         return None
     try:
-        return pd.read_csv(path)
-    except UnicodeDecodeError:
-        return pd.read_csv(path, encoding="utf-8-sig")
+        return int(s)
+    except ValueError:
+        return None
 
 
-def _load_products_df() -> pd.DataFrame:
-    global _products_df
-    if _products_df is not None:
-        return _products_df
+# ---------- 데이터 로딩 ----------
 
-    df = _load_csv(PRODUCTS_CSV)
-    if df is None:
-        # 비어 있으면라도 DataFrame 반환
-        df = pd.DataFrame(columns=["name", "price"])
-
-    # name/price 가 없으면 최대한 맞춰보기
-    if "name" not in df.columns:
-        # 첫 번째 문자열 컬럼을 name 으로 사용
-        for c in df.columns:
-            if df[c].dtype == object:
-                df = df.rename(columns={c: "name"})
-                break
-    if "price" not in df.columns:
-        df["price"] = None
-
-    # 문자열화
-    df["name"] = df["name"].astype(str)
-
-    _products_df = df
-    return _products_df
+def _load_csv(path: str) -> pd.DataFrame:
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"CSV 파일을 찾을 수 없습니다: {path}")
+    df = pd.read_csv(path)
+    return df
 
 
-# =========================
-# 상품 매칭 유틸
-# =========================
+def _prepare_product_master() -> pd.DataFrame:
+    """
+    CU 공식 상품 리스트 로드 + 정규화 컬럼 추가
+    - data/cu_official_products.csv 를 사용
+    - name / NAME / 상품명 등 이름 컬럼, price / PRICE / 가격 등 가격 컬럼 자동 탐색
+    """
+    df = _load_csv("data/cu_official_products.csv")
 
-
-def _normalize_item_name(raw: str) -> str:
-    if not isinstance(raw, str):
-        return ""
-    name = raw.strip()
-    if not name:
-        return ""
-
-    # 괄호 안 내용 제거: '까르보불닭볶음면(큰컵)' -> '까르보불닭볶음면'
-    import re
-
-    name = re.sub(r"\([^)]*\)", "", name)
-    # ' 등', ' 외' 제거
-    for suf in [" 등", " 외"]:
-        if name.endswith(suf):
-            name = name[: -len(suf)]
-    return name.strip()
-
-
-def _split_items(text: str) -> List[str]:
-    if not isinstance(text, str) or not text.strip():
-        return []
-    tmp = (
-        text.replace("+", ",")
-        .replace("/", ",")
-        .replace("·", ",")
-        .replace("&", ",")
-    )
-    parts = [p.strip() for p in tmp.split(",")]
-    return [p for p in parts if p]
-
-
-def _match_product_to_official(
-        raw_name: str, df_products: pd.DataFrame
-) -> Tuple[str, Optional[int]]:
-    if not isinstance(raw_name, str) or not raw_name.strip():
-        return "", None
-
-    base = _normalize_item_name(raw_name)
-    if not base:
-        return raw_name.strip(), None
-
-    s = df_products["name"].astype(str)
-
-    # 1) base 가 그대로 포함되는 상품
-    contains = df_products[s.str.contains(base, na=False, regex=False)]
-
-    # 2) 못 찾으면, 첫 단어/두 단어 기반 재시도
-    if contains.empty:
-        tokens = base.split()
-        if len(tokens) >= 2:
-            short = " ".join(tokens[:2])
-        elif tokens:
-            short = tokens[0]
-        else:
-            short = base
-
-        contains = df_products[s.str.contains(short, na=False, regex=False)]
-
-    if contains.empty:
-        return raw_name.strip(), None
-
-    # 여러 개면 이름이 가장 짧은 상품 선택
-    row = contains.iloc[contains["name"].str.len().argmin()]
-    official_name = str(row["name"])
-    price = None
-    if "price" in row and not pd.isna(row["price"]):
-        try:
-            price = int(row["price"])
-        except Exception:
-            price = None
-    return official_name, price
-
-
-# =========================
-# 콤보 CSV -> 문서 생성
-# =========================
-
-
-def _build_combo_docs() -> List[Dict[str, Any]]:
-    df_comb = _load_csv(COMBINATION_CSV)
-    df_syn = _load_csv(SYNTHETIC_CSV)
-
-    frames: List[pd.DataFrame] = []
-    if df_comb is not None:
-        frames.append(df_comb)
-    if df_syn is not None:
-        frames.append(df_syn)
-
-    if not frames:
-        print("[_build_combo_docs] combination/synthetic CSV 를 찾을 수 없습니다.")
-        return []
-
-    df_all = pd.concat(frames, ignore_index=True)
-
-    # 필수 컬럼 존재 여부 확인
-    required_cols = [
-        "조합 이름",
-        "주요 상품",
-        "보조 상품(들)",
-        "키워드 / 상황",
-        "카테고리",
+    # 이름 컬럼 찾기
+    name_cols = [
+        c for c in df.columns
+        if any(k in str(c) for k in ["상품명", "name", "NAME"])
     ]
-    for col in required_cols:
-        if col not in df_all.columns:
-            print(f"[_build_combo_docs] 필수 컬럼 누락: {col}")
-            # 그래도 일단 진행 (해당 컬럼은 빈 문자열로 처리)
+    if not name_cols:
+        raise ValueError("cu_official_products.csv 에서 상품명 컬럼을 찾지 못했습니다.")
+    name_col = name_cols[0]
 
-    df_products = _load_products_df()
+    # 가격 컬럼 찾기
+    price_cols = [
+        c for c in df.columns
+        if any(k in str(c) for k in ["가격", "price", "PRICE"])
+    ]
+    if not price_cols:
+        raise ValueError("cu_official_products.csv 에서 가격 컬럼을 찾지 못했습니다.")
+    price_col = price_cols[0]
 
-    docs: List[Dict[str, Any]] = []
+    df = df[[name_col, price_col]].copy()
+    df.rename(columns={name_col: "name", price_col: "price"}, inplace=True)
 
-    for idx, row in df_all.iterrows():
-        combo_name = str(row.get("조합 이름", "") or "").strip()
-        main_product = str(row.get("주요 상품", "") or "").strip()
-        sub_products = str(row.get("보조 상품(들)", "") or "").strip()
-        situation = str(row.get("키워드 / 상황", "") or "").strip()
-        category = str(row.get("카테고리", "") or "").strip() or "기타"
+    df["name"] = df["name"].astype(str)
+    df["name_norm"] = df["name"].apply(_normalize_text)
+    df["price_int"] = df["price"].apply(_safe_int)
 
-        # 이름/상품이 모두 비어 있으면 스킵
-        if not combo_name and not main_product and not sub_products:
+    return df
+
+
+def _guess_combo_name_column(df: pd.DataFrame) -> Optional[str]:
+    candidates = [
+        c for c in df.columns
+        if any(k in str(c) for k in ["조합명", "꿀조합", "세트명", "세트", "이름", "name", "title"])
+    ]
+    return candidates[0] if candidates else None
+
+
+def _guess_item_columns(df: pd.DataFrame) -> List[str]:
+    """
+    주상품/보조상품, item1, product1 같은 컬럼들을 모두 아이템 컬럼으로 사용
+    """
+    cols = []
+    for c in df.columns:
+        cs = str(c)
+        if any(k in cs for k in ["주상품", "보조상품", "상품", "item", "Item", "product", "Product"]):
+            cols.append(c)
+    return cols
+
+
+def _guess_category_column(df: pd.DataFrame) -> Optional[str]:
+    candidates = [
+        c for c in df.columns
+        if any(k in str(c) for k in ["카테고리", "category", "분류"])
+    ]
+    return candidates[0] if candidates else None
+
+
+def _guess_mood_column(df: pd.DataFrame) -> Optional[str]:
+    # 기분/상황 태그 등
+    candidates = [
+        c for c in df.columns
+        if any(k in str(c) for k in ["상황", "키워드", "분위기", "태그", "vibe", "mood"])
+    ]
+    return candidates[0] if candidates else None
+
+
+# ---------- CU 상품 매칭 (여기서 CU에 없는 상품은 버린다) ----------
+
+def _build_combo_docs_from_df(
+        df: pd.DataFrame,
+        df_products: pd.DataFrame,
+        default_category: str,
+        id_offset: int,
+) -> List[dict]:
+    """
+    하나의 CSV(DataFrame)에서 꿀조합 리스트 추출.
+    - 상품명은 CU 공식 상품과 최대한 매칭하여 official_name / price 를 채움.
+    - CU에 존재하지 않는 상품(매칭 실패)은 해당 콤보에서 제외.
+    - 콤보 안의 모든 상품이 매칭 실패하면 그 콤보 자체를 버림.
+    """
+    combo_name_col = _guess_combo_name_column(df)
+    item_cols = _guess_item_columns(df)
+    category_col = _guess_category_column(df)
+    mood_col = _guess_mood_column(df)
+
+    combos: List[dict] = []
+
+    if not item_cols:
+        # 아이템 컬럼이 하나도 없으면 스킵
+        return combos
+
+    # 미리 product master 를 numpy 배열로 만들어 매칭 속도 약간 개선
+    prod_names_norm = df_products["name_norm"].to_numpy()
+    prod_names = df_products["name"].to_numpy()
+    prod_prices = df_products["price_int"].to_numpy()
+
+    def _match_product(item_name: str) -> Tuple[Optional[str], Optional[int]]:
+        """
+        item_name 을 CU 마스터와 매칭
+        - 1순위: 정규화 이름 완전 일치
+        - 2순위: fuzzy match (SequenceMatcher), 0.6 이상일 때만 채택
+        - 매칭 실패 또는 가격 정보 없으면 (None, None) 반환
+        """
+        if not isinstance(item_name, str):
+            item_name_str = str(item_name) if item_name is not None else ""
+        else:
+            item_name_str = item_name
+
+        target_norm = _normalize_text(item_name_str)
+        if not target_norm:
+            return None, None
+
+        # 1) exact match
+        exact_idx = np.where(prod_names_norm == target_norm)[0]
+        if len(exact_idx) > 0:
+            i = int(exact_idx[0])
+            price_val = prod_prices[i]
+            price_int = _safe_int(price_val)
+            if price_int is None:
+                return None, None
+            return prod_names[i], price_int
+
+        # 2) fuzzy
+        best_i = None
+        best_score = 0.0
+        for i, pn in enumerate(prod_names_norm):
+            score = SequenceMatcher(None, target_norm, pn).ratio()
+            if score > best_score:
+                best_score = score
+                best_i = i
+
+        if best_i is not None and best_score >= 0.6:
+            price_val = prod_prices[best_i]
+            price_int = _safe_int(price_val)
+            if price_int is None:
+                return None, None
+            return prod_names[best_i], price_int
+
+        # CU에 없는 상품으로 판단 → 추천에서 제외
+        return None, None
+
+    for ridx, row in df.iterrows():
+        raw_name = (
+            str(row[combo_name_col]).strip()
+            if combo_name_col and pd.notna(row.get(combo_name_col))
+            else ""
+        )
+        combo_name = raw_name or f"꿀조합 {id_offset + ridx}"
+
+        # 카테고리
+        if category_col and pd.notna(row.get(category_col)):
+            category = str(row[category_col]).strip()
+        else:
+            category = default_category
+
+        # 아이템들(원본)
+        items_raw: List[str] = []
+        for c in item_cols:
+            val = row.get(c)
+            if pd.isna(val):
+                continue
+            s = str(val).strip()
+            if not s:
+                continue
+            items_raw.append(s)
+
+        if not items_raw:
             continue
 
-        raw_items: List[str] = []
-        if main_product:
-            # 주요 상품도 분리 로직 통일
-            raw_items.extend(_split_items(main_product))
-        if sub_products:
-            raw_items.extend(_split_items(sub_products))
+        # CU 공식 상품으로 매핑된 아이템만 모으기
+        items: List[dict] = []
+        for item_name in items_raw:
+            official_name, price_int = _match_product(item_name)
+            # CU에 없는 상품은 통째로 버린다
+            if official_name is None or price_int is None:
+                continue
 
-        # 그래도 없으면 원문 텍스트에서 최소 1개는 사용
-        if not raw_items:
-            if main_product:
-                raw_items.append(main_product)
-            elif sub_products:
-                raw_items.append(sub_products)
+            items.append(
+                {
+                    "original_name": item_name,
+                    "name": official_name,  # ✅ 반드시 CU 상품명
+                    "price": int(price_int),
+                }
+            )
 
-        official_items: List[str] = []
-        prices: List[Optional[int]] = []
-        for raw_name in raw_items:
-            official_name, price = _match_product_to_official(raw_name, df_products)
-            if official_name:
-                official_items.append(official_name)
-                prices.append(price)
+        # CU 상품이 하나도 없는 콤보는 버림
+        if not items:
+            continue
 
-        if not official_items:
-            # 최악의 경우 raw_items[0]만이라도 사용
-            official_items = [raw_items[0]]
-            prices = [None]
+        # 총 가격 계산 (모든 상품에 price가 있다고 가정)
+        total_price = sum(i["price"] for i in items)
 
-        total_price = sum(
-            int(p) for p in prices if isinstance(p, (int, float))
+        # 분위기/상황 키워드
+        mood = ""
+        if mood_col and pd.notna(row.get(mood_col)):
+            mood = str(row[mood_col]).strip()
+
+        # embedding 에 사용할 텍스트 (CU 공식 상품명 기준)
+        item_names_for_text = ", ".join(i["name"] for i in items)
+        base_text = (
+            f"꿀조합 이름: {combo_name}. "
+            f"카테고리: {category}. "
+            f"구성 상품: {item_names_for_text}. "
         )
-        total_price = int(total_price) if total_price > 0 else None
-
-        # 임베딩용 텍스트
-        items_text = ", ".join(official_items)
-        semantic_parts = [combo_name, category, items_text]
-        if situation:
-            semantic_parts.append(f"상황: {situation}")
-        semantic_text = " | ".join([p for p in semantic_parts if p])
+        if mood:
+            base_text += f"어울리는 상황/분위기: {mood}."
 
         doc = {
-            "id": idx,
-            "name": combo_name or f"꿀조합 {idx + 1}",
+            "id": id_offset + ridx,
+            "name": combo_name,
             "category": category,
-            "situation": situation,
-            "items": official_items,       # CU 상품명
-            "item_prices": prices,        # 각 상품 가격
-            "total_price": total_price,   # 총합
-            "semantic_text": semantic_text,
+            "items": items,               # ✅ 전부 CU 상품
+            "total_price": total_price,   # ✅ 항상 int
+            "mood": mood,
+            "embedding_text": base_text,
         }
-        docs.append(doc)
+        combos.append(doc)
+
+    return combos
+
+
+def _build_combo_docs() -> List[dict]:
+    """
+    combination.csv + synthetic_honey_combos_1000.csv 를 통합해서
+    하나의 꿀조합 리스트로 만든다.
+    """
+    df_products = _prepare_product_master()
+
+    docs: List[dict] = []
+
+    # 1) combination.csv (실제 꿀조합)
+    try:
+        df_combo = _load_csv("data/combination.csv")
+        docs += _build_combo_docs_from_df(
+            df_combo,
+            df_products=df_products,
+            default_category="기타",
+            id_offset=0,
+        )
+    except FileNotFoundError:
+        pass
+
+    # 2) synthetic_honey_combos_1000.csv (synthetic 데이터)
+    try:
+        df_syn = _load_csv("data/synthetic_honey_combos_1000.csv")
+        docs += _build_combo_docs_from_df(
+            df_syn,
+            df_products=df_products,
+            default_category="기타",
+            id_offset=10_000,
+        )
+    except FileNotFoundError:
+        pass
 
     return docs
 
 
-# =========================
-# 임베딩 유틸
-# =========================
+# ---------- 임베딩 사전 계산 ----------
 
-
-def _embed_texts(texts: List[str]) -> np.ndarray:
-    client = _get_openai_client()
-    resp = client.embeddings.create(model=EMBED_MODEL, input=texts)
-    vecs = [d.embedding for d in resp.data]
-    return np.array(vecs, dtype="float32")
-
-
-def _embed_query(text: str) -> np.ndarray:
-    client = _get_openai_client()
-    resp = client.embeddings.create(model=EMBED_MODEL, input=[text])
-    v = np.array(resp.data[0].embedding, dtype="float32")
-    return v
-
-
-def _cosine_sim(q: np.ndarray, M: np.ndarray) -> np.ndarray:
-    q_norm = q / (np.linalg.norm(q) + 1e-8)
-    M_norm = M / (np.linalg.norm(M, axis=1, keepdims=True) + 1e-8)
-    return M_norm @ q_norm
-
-
-# =========================
-# precomputed 인덱스
-# =========================
-
-
-def build_precomputed_embeddings() -> None:
+def build_precomputed_embeddings():
+    """
+    - data/*.csv 를 읽어서 combo_docs.json + combo_embeddings.npy 생성
+    - 개발/배포 시 한 번 실행
+    """
+    print("[build_precomputed_embeddings] 콤보 문서 생성 중...")
     docs = _build_combo_docs()
     print(f"[build_precomputed_embeddings] 총 {len(docs)} 개 조합 처리 중...")
 
     if not docs:
-        print("[build_precomputed_embeddings] 생성된 콤보가 없습니다. CSV 컬럼을 다시 확인하세요.")
+        print("[build_precomputed_embeddings] 생성된 콤보가 없습니다. CSV 컬럼 매핑을 확인하세요.")
         return
 
-    texts = [d["semantic_text"] for d in docs]
-    embeds = _embed_texts(texts)
+    client = _get_openai_client()
 
-    with PRECOMP_DOCS_JSON.open("w", encoding="utf-8") as f:
-        json.dump(docs, f, ensure_ascii=False, indent=2)
-    np.save(PRECOMP_EMB_NPY, embeds)
+    texts = [d["embedding_text"] for d in docs]
+    embeddings: List[List[float]] = []
 
-    print(f"[build_precomputed_embeddings] 저장 완료: {PRECOMP_DOCS_JSON}, {PRECOMP_EMB_NPY}")
+    # 너무 길어지는 것 방지용 batch
+    BATCH = 100
+    for i in range(0, len(texts), BATCH):
+        batch = texts[i: i + BATCH]
+        resp = client.embeddings.create(
+            model=EMBEDDING_MODEL,
+            input=batch,
+        )
+        for e in resp.data:
+            embeddings.append(e.embedding)
+
+    arr = np.array(embeddings, dtype=np.float32)
+
+    os.makedirs("precomputed", exist_ok=True)
+    with open("precomputed/combo_docs.json", "w", encoding="utf-8") as f:
+        json.dump(docs, f, ensure_ascii=False, indent=2, default=_json_default)
+    np.save("precomputed/combo_embeddings.npy", arr)
+
+    print("[build_precomputed_embeddings] 저장 완료: precomputed/combo_docs.json, combo_embeddings.npy")
 
 
-def _load_semantic_index() -> Tuple[List[Dict[str, Any]], np.ndarray]:
+def _load_semantic_index() -> Tuple[List[dict], np.ndarray]:
+    """
+    서버 런타임에서 호출:
+    - precomputed 존재하면 바로 로드
+    - 없으면 즉석에서 생성(속도 느릴 수 있음)
+    """
     global _combo_docs, _combo_embeddings
 
     if _combo_docs is not None and _combo_embeddings is not None:
         return _combo_docs, _combo_embeddings
 
-    # 미리 계산된 파일 있으면 사용
-    if PRECOMP_DOCS_JSON.exists() and PRECOMP_EMB_NPY.exists():
-        with PRECOMP_DOCS_JSON.open("r", encoding="utf-8") as f:
+    docs_path = "precomputed/combo_docs.json"
+    emb_path = "precomputed/combo_embeddings.npy"
+
+    if os.path.exists(docs_path) and os.path.exists(emb_path):
+        with open(docs_path, "r", encoding="utf-8") as f:
             _combo_docs = json.load(f)
-        _combo_embeddings = np.load(PRECOMP_EMB_NPY)
+        _combo_embeddings = np.load(emb_path)
         return _combo_docs, _combo_embeddings
 
-    # 없으면 즉석 생성
+    # fallback: 즉석 생성
+    print("[_load_semantic_index] precomputed 파일이 없어, CSV에서 즉석 생성합니다.")
     docs = _build_combo_docs()
     if not docs:
-        _combo_docs = []
-        _combo_embeddings = np.zeros((0, 1536), dtype="float32")
-        return _combo_docs, _combo_embeddings
+        raise RuntimeError("콤보 데이터를 하나도 만들지 못했습니다. CSV 구조를 확인하세요.")
 
-    texts = [d["semantic_text"] for d in docs]
-    embeds = _embed_texts(texts)
+    client = _get_openai_client()
+    texts = [d["embedding_text"] for d in docs]
+    resp = client.embeddings.create(
+        model=EMBEDDING_MODEL,
+        input=texts,
+    )
+    embeds = np.array([e.embedding for e in resp.data], dtype=np.float32)
 
     _combo_docs = docs
     _combo_embeddings = embeds
     return _combo_docs, _combo_embeddings
 
 
-# =========================
-# 공개: 추천 함수
-# =========================
+# ---------- 추천 로직 (RAG) ----------
+
+def _cosine_sim(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    a_norm = a / (np.linalg.norm(a, axis=1, keepdims=True) + 1e-8)
+    b_norm = b / (np.linalg.norm(b, keepdims=True) + 1e-8)
+    return a_norm @ b_norm
 
 
-def recommend_combos_openai_rag(user_text: str, top_k: int = 3) -> List[Dict[str, Any]]:
+def recommend_combos_openai_rag(user_text: str, top_k: int = 3) -> List[dict]:
+    """
+    - user_text 임베딩
+    - 사전 계산된 combo_embeddings 와 cosine similarity
+    - 상위 top_k 개 조합 리턴
+    """
     docs, embeds = _load_semantic_index()
-    if not docs or embeds.size == 0:
+    if not docs:
         return []
 
-    q_vec = _embed_query(user_text)
-    sims = _cosine_sim(q_vec, embeds)  # (N,)
+    client = _get_openai_client()
+    resp = client.embeddings.create(
+        model=EMBEDDING_MODEL,
+        input=[user_text],
+    )
+    q_emb = np.array(resp.data[0].embedding, dtype=np.float32)
 
-    # 상위 top_k 인덱스
-    top_idx = np.argsort(-sims)[:top_k]
+    sims = _cosine_sim(embeds, q_emb)
+    idx_sorted = np.argsort(-sims)[: top_k]
 
-    results: List[Dict[str, Any]] = []
-    for rank, i in enumerate(top_idx):
-        doc = docs[int(i)]
-        score = float(sims[int(i)])
-
-        items = doc.get("items", [])
-        prices = doc.get("item_prices", [])
-        total_price = doc.get("total_price")
-
-        if total_price:
-            price_text = f"{total_price:,}원"
-        else:
-            price_text = "가격 정보 없음"
-
-        # 메인 추천(첫 번째)만 설명 붙이기
-        if rank == 0:
-            reason = (
-                "입력하신 문장의 의미를 임베딩으로 분석해서 "
-                "가장 잘 어울리는 편의점 꿀조합을 골랐어요. "
-                f"(기준: '{user_text}')\n\n"
-            )
-            if doc.get("situation"):
-                reason += f"이 조합은 '{doc['situation']}' 상황에 특히 잘 맞아요.\n\n"
-            elif doc.get("category"):
-                reason += f"이 조합은 '{doc['category']}' 카테고리 상황에 어울려요.\n\n"
-            reason += f"이 조합을 모두 담으면 대략 {price_text} 정도예요."
-        else:
-            reason = ""
-
+    results: List[dict] = []
+    for idx in idx_sorted:
+        d = docs[int(idx)]
         results.append(
             {
-                "name": doc.get("name", f"꿀조합 {i+1}"),
-                "category": doc.get("category", "기타"),
-                "items": items,
-                "item_prices": prices,
-                "total_price": total_price,
-                "reason": reason,
-                "similarity": score,
+                "id": d["id"],
+                "name": d["name"],
+                "category": d.get("category", "기타"),
+                "items": d.get("items", []),         # ✅ 이미 CU 상품만
+                "total_price": d.get("total_price"), # ✅ int
+                "mood": d.get("mood", ""),
             }
         )
 
     return results
 
 
-# =========================
-# 공개: 카테고리 추론
-# =========================
+# ---------- (선택) 카테고리 추론 ----------
+
+CATEGORY_KEYWORDS: Dict[str, List[str]] = {
+    "라면/분식": ["라면", "컵라면", "국물라면", "떡볶이", "분식", "우동", "튀김", "어묵"],
+    "식사류": ["밥", "식사", "도시락", "김치찌개", "덮밥", "카레", "죽", "파스타", "볶음밥"],
+    "간편식": ["삼각김밥", "주먹밥", "햄버거", "샌드위치", "핫도그", "토스트"],
+    "디저트": [
+        "디저트",
+        "빵",
+        "케이크",
+        "쿠키",
+        "초콜릿",
+        "젤리",
+        "아이스크림",
+        "빙수",
+        "달달",
+        "달콤",
+        "달다",
+    ],
+    "술안주/야식": [
+        "맥주",
+        "소주",
+        "와인",
+        "안주",
+        "야식",
+        "치킨",
+        "족발",
+        "포차",
+        "편맥",
+        "편의점맥주",
+    ],
+}
 
 
-def infer_category_from_text(user_text: str) -> Optional[str]:
-    docs, embeds = _load_semantic_index()
-    if not docs or embeds.size == 0:
-        return None
-
-    q_vec = _embed_query(user_text)
-    sims = _cosine_sim(q_vec, embeds)
-    i = int(np.argmax(sims))
-    cat = docs[i].get("category")
-    return cat or None
+def infer_category_from_text(text: str) -> Optional[str]:
+    text = text or ""
+    best_cat = None
+    best_score = 0
+    for cat, kws in CATEGORY_KEYWORDS.items():
+        score = sum(1 for kw in kws if kw in text)
+        if score > best_score:
+            best_score = score
+            best_cat = cat
+    return best_cat if best_score > 0 else None
