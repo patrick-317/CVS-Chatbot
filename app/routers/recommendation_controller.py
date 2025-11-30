@@ -1,9 +1,9 @@
-from typing import List
+from typing import Optional, Dict, Any, List
 
 from fastapi import APIRouter
+from pydantic import BaseModel, Field
 
 from app.schemas.recommendation_model import (
-    KakaoSkillRequest,
     KakaoSkillResponse,
     Template,
     Component,
@@ -12,64 +12,102 @@ from app.schemas.recommendation_model import (
     ItemCardHead,
     SimpleText,
 )
-from app.services.recommendation_service import (
-    recommend_combos_openai_rag,
-    infer_category_from_text,
-)
+from app.services.recommendation_service import recommend_combos_openai_rag
+
+
+# ---------- 카카오에서 오는 요청 바디 스키마 ----------
+
+
+class KakaoUserRequest(BaseModel):
+    timezone: Optional[str] = None
+    utterance: str
+    params: Dict[str, Any] = Field(default_factory=dict)
+    block: Optional[Dict[str, Any]] = None
+    user: Optional[Dict[str, Any]] = None
+
+
+class KakaoAction(BaseModel):
+    id: Optional[str] = None
+    name: Optional[str] = None
+    params: Dict[str, Any] = Field(default_factory=dict)
+    detailParams: Dict[str, Any] = Field(default_factory=dict)
+
+
+class KakaoSkillPayload(BaseModel):
+    userRequest: KakaoUserRequest
+    action: KakaoAction
+    bot: Optional[Dict[str, Any]] = None
+    intent: Optional[Dict[str, Any]] = None
+
 
 router = APIRouter(prefix="/api/v1", tags=["kakao"])
 
 
-def _build_item_card_from_result(result: dict) -> ItemCard:
+# ---------- 응답용 헬퍼 ----------
+
+
+def _build_item_card_from_result(result: Dict[str, Any]) -> ItemCard:
     """
-    recommendation_service 가 반환하는 1개 결과(dict)를
-    Kakao ItemCard 형태로 변환.
+    recommendation_service.recommend_combos_openai_rag() 의 1개 결과를
+    Kakao itemCard 로 변환
     """
-    combo_name = result.get("name", "편의점 꿀조합")
-    category = result.get("category", "")
-    items = result.get("items", [])
+
+    # 조합 이름
+    combo_name = (
+            result.get("ai_combo_name")
+            or result.get("name")
+            or "편의점 꿀조합"
+    )
+
+    # 카테고리
+    category = result.get("category") or "기타"
 
     head = ItemCardHead(
         title=combo_name,
-        description=f"카테고리: {category}" if category else None,
+        description=f"카테고리: {category}",
     )
 
+    # 아이템 리스트 (실제 구매해야 하는 상품들)
+    items: List[Dict[str, Any]] = result.get("items", [])
     item_list: List[ListItem] = []
-    for i, item in enumerate(items, start=1):
-        # dict 형태(이름 + 가격)와 문자열 둘 다 지원
-        if isinstance(item, dict):
-            title_name = item.get("name") or "상품"
-            price = item.get("price")
-            desc = f"{price:,}원" if isinstance(price, (int, float)) else ""
+
+    for idx, item in enumerate(items, start=1):
+        # 서비스에서 내려주는 키 이름 여러 경우 방어
+        name = (
+                item.get("name")
+                or item.get("product_name")
+                or item.get("item_name")
+                or "상품"
+        )
+
+        price = item.get("price") or item.get("unit_price")
+        if isinstance(price, (int, float)):
+            price_text = f"{price:,}원"
+        elif isinstance(price, str) and price.strip():
+            price_text = price
         else:
-            title_name = str(item)
-            desc = ""
+            price_text = ""
+
         item_list.append(
             ListItem(
-                title=f"{i}. {title_name}",
-                description=desc,
+                title=f"{idx}. {name}",
+                description=price_text,
                 imageUrl=None,
             )
         )
 
-    card = ItemCard(
+    return ItemCard(
         head=head,
         imageUrl=None,
         itemList=item_list,
     )
-    return card
 
 
-def _build_quick_replies(user_text: str) -> list[dict]:
-    """
-    하단에 붙일 quickReplies 생성.
-    user_text로부터 대략적인 category 를 추론해서 첫 번째 버튼에 반영.
-    """
-    inferred = infer_category_from_text(user_text) or "아무거나"
-
-    base = [
+def _build_quick_replies() -> List[Dict[str, Any]]:
+    """하단 고정 버튼 (간단 버전)"""
+    return [
         {
-            "label": "다른 추천",
+            "label": "아무거나 말고 다른 거",
             "action": "message",
             "messageText": "다른 꿀조합 추천해줘",
         },
@@ -90,8 +128,8 @@ def _build_quick_replies(user_text: str) -> list[dict]:
         },
     ]
 
-    base[0]["label"] = f"{inferred} 말고 다른 거"
-    return base
+
+# ---------- 메인 엔드포인트 ----------
 
 
 @router.post(
@@ -99,50 +137,70 @@ def _build_quick_replies(user_text: str) -> list[dict]:
     response_model=KakaoSkillResponse,
     response_model_exclude_none=True,
 )
-def kakao_recommend_combo(request: KakaoSkillRequest):
+def kakao_recommend_combo(payload: KakaoSkillPayload):
     """
-    오픈빌더에서 들어온 사용자 발화를 기반으로
-    RAG 추천 결과를 Kakao Skill JSON 으로 반환.
+    카카오 오픈빌더 스킬 엔드포인트(A안).
+    - userRequest.utterance 만 받아서 서버에서 전부 추천 생성
     """
-    user_text = request.userRequest.utterance or ""
+
+    user_text = (payload.userRequest.utterance or "").strip()
     if not user_text:
         user_text = "아무거나 추천해줘"
 
-    # 1) 추천 로직 호출
+    # 1) 추천 로직 실행 (RAG + 딥러닝 포함)
     results = recommend_combos_openai_rag(user_text, top_k=3)
 
-    # 추천이 하나도 없을 때: simpleText 로 안내
+    # 추천이 없을 때: 안내 메시지
     if not results:
         simple = SimpleText(
             text="죄송해요, 지금은 추천할 꿀조합을 찾지 못했어요.\n다른 표현으로 다시 말해주실 수 있을까요?"
         )
         template = Template(
             outputs=[Component(simpleText=simple)],
-            quickReplies=_build_quick_replies(user_text),
+            quickReplies=_build_quick_replies(),
         )
         return KakaoSkillResponse(version="2.0", template=template)
 
-    # 2) 첫 번째 추천을 ItemCard로, 나머지는 설명 텍스트에 포함
+    # 2) 대표 추천 1개를 카드로, 나머지는 텍스트에 요약
     main = results[0]
     item_card = _build_item_card_from_result(main)
 
-    # 부가 설명 텍스트 (다른 후보들)
-    other_lines = []
+    # 메인 설명/이유 + 총 가격
+    reason = main.get("reason") or ""
+    total_price = main.get("total_price")
+    if isinstance(total_price, (int, float)):
+        reason += f"\n\n이 조합을 모두 담으면 대략 {total_price:,}원 정도예요."
+
+    # 다른 후보들
+    other_lines: List[str] = []
     for sub in results[1:]:
-        other_lines.append(f"- {sub.get('name', '')} ({sub.get('category', '')})")
+        name = sub.get("ai_combo_name") or sub.get("name") or ""
+        cat = sub.get("category") or ""
+        if name:
+            if cat:
+                other_lines.append(f"- {name} ({cat})")
+            else:
+                other_lines.append(f"- {name}")
 
-    desc_text = main.get("reason", "")
     if other_lines:
-        desc_text += "\n\n다른 추천 후보\n" + "\n".join(other_lines)
+        if not reason.endswith("\n\n") and reason:
+            reason += "\n\n"
+        reason += "다른 추천 후보\n" + "\n".join(other_lines)
 
-    simple = SimpleText(text=desc_text)
+    simple = SimpleText(
+        text=(
+                f"입력하신 문장의 의미를 임베딩으로 분석해서 "
+                f"가장 비슷한 분위기의 꿀조합을 골랐어요. (기준: '{user_text}')\n\n"
+                + reason
+        )
+    )
 
     template = Template(
         outputs=[
             Component(itemCard=item_card),
             Component(simpleText=simple),
         ],
-        quickReplies=_build_quick_replies(user_text),
+        quickReplies=_build_quick_replies(),
     )
 
     return KakaoSkillResponse(version="2.0", template=template)
