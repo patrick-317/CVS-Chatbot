@@ -18,30 +18,20 @@ from app.services.recommendation_service import (
 router = APIRouter(prefix="/api/v1", tags=["kakao"])
 
 
-# ---------- Kakao 응답 구성 유틸 ----------
+# ============================================================
+# Kakao 응답 구성 유틸
+# ============================================================
 
 def _build_item_card_from_result(result: dict) -> ItemCard:
     """
     recommendation_service 결과(dict)를 Kakao ItemCard 로 변환.
-
-    result 예시:
-    {
-        "name": "다이어트 간식",
-        "category": "건강/다이어트",
-        "items": [
-            {"name": "샐)오리지널닭가슴살샐러", "price": 4800},
-            {"name": "샐)허니리코타치즈샐러드", "price": 4800},
-        ],
-        "total_price": 9600,
-        "mood": "다이어트, 건강, 운동, 식단 관리"
-    }
     """
     combo_name = result.get("name", "편의점 꿀조합")
     category = result.get("category", "")
     items = result.get("items", [])
 
     head = ItemCardHead(
-        title=f"{combo_name}",
+        title=combo_name,
         description=f"카테고리: {category}" if category else None,
     )
 
@@ -67,12 +57,11 @@ def _build_item_card_from_result(result: dict) -> ItemCard:
             )
         )
 
-    card = ItemCard(
+    return ItemCard(
         head=head,
         imageUrl=None,
         itemList=item_list,
     )
-    return card
 
 
 def _build_quick_replies(user_text: str) -> list[dict]:
@@ -80,7 +69,7 @@ def _build_quick_replies(user_text: str) -> list[dict]:
 
     base = [
         {
-            "label": "다른 추천",
+            "label": f"{inferred} 말고 다른 거",
             "action": "message",
             "messageText": "다른 꿀조합 추천해줘",
         },
@@ -100,12 +89,12 @@ def _build_quick_replies(user_text: str) -> list[dict]:
             "messageText": "디저트 추천",
         },
     ]
-
-    base[0]["label"] = f"{inferred} 말고 다른 거"
     return base
 
 
-# ---------- 엔드포인트 ----------
+# ============================================================
+# 메인 엔드포인트
+# ============================================================
 
 @router.post(
     "/kakao/recommend",
@@ -115,13 +104,13 @@ def _build_quick_replies(user_text: str) -> list[dict]:
 def kakao_recommend_combo(request: KakaoSkillRequest):
     """
     카카오 오픈빌더에서 호출하는 메인 엔드포인트.
-    - userRequest.utterance 하나만 받아서, 바로 꿀조합 추천.
+    - userRequest.utterance 기준으로 꿀조합 추천.
     """
     user_text = request.userRequest.utterance or ""
     if not user_text.strip():
         user_text = "아무거나 추천해줘"
 
-    # 1) 추천 로직 (RAG)
+    # 1) 추천 로직
     results = recommend_combos_openai_rag(user_text, top_k=3)
 
     # 2) 추천 없음 처리
@@ -135,12 +124,12 @@ def kakao_recommend_combo(request: KakaoSkillRequest):
         )
         return KakaoSkillResponse(version="2.0", template=template)
 
-    # 3) 메인 카드 + 부가 설명
+    # 3) 메인 카드
     main = results[0]
     item_card = _build_item_card_from_result(main)
 
+    # 4) 설명 문장 (한 번만 출력)
     desc_lines: list[str] = []
-
     desc_lines.append(
         f"입력하신 문장의 의미를 임베딩으로 분석해서 가장 비슷한 분위기의 꿀조합을 골랐어요. (기준: '{user_text}')"
     )
@@ -157,7 +146,7 @@ def kakao_recommend_combo(request: KakaoSkillRequest):
     else:
         desc_lines.append("이 조합을 모두 담으면 대략 가격 정보 없음 정도예요.")
 
-    # 다른 추천 후보
+    # 5) 다른 추천 후보
     if len(results) > 1:
         other_lines = []
         for sub in results[1:]:
