@@ -8,8 +8,6 @@ from torch import nn
 from torch.utils.data import Dataset, DataLoader
 
 # -------------------- 경로 설정 --------------------
-# combo_model.py 위치: CVS-Chatbot/app/models/combo_model.py
-# 프로젝트 루트: CVS-Chatbot
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
 
 DATA_DIR = os.path.join(BASE_DIR, "data")

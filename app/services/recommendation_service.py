@@ -7,19 +7,19 @@ import pandas as pd
 
 from app.schemas.recommendation_model import HoneyCombo, ComboItem
 
+
 # ---------------------------------------------------------
 # 경로 / 상수
 # ---------------------------------------------------------
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
-
 DATA_DIR = os.path.join(BASE_DIR, "data")
 
 CU_PRODUCTS_PATH = os.path.join(DATA_DIR, "cu_official_products.csv")
 COMB_PATH = os.path.join(DATA_DIR, "combination.csv")
 SYN_PATH = os.path.join(DATA_DIR, "synthetic_honey_combos_1000.csv")
 
-# 태그 상수
+# 태그
 TAG_SPICY = "SPICY"
 TAG_SWEET = "SWEET"
 TAG_HOT_SOUP = "HOT_SOUP"
@@ -32,6 +32,7 @@ TAG_PROTEIN = "PROTEIN"
 TAG_STRESS = "STRESS"
 TAG_RAINY = "RAINY"
 
+
 # ---------------------------------------------------------
 # 전역 캐시
 # ---------------------------------------------------------
@@ -39,12 +40,13 @@ TAG_RAINY = "RAINY"
 _cu_df: Optional[pd.DataFrame] = None
 _cu_name_map: Optional[Dict[str, Dict[str, Any]]] = None
 
-_combo_rows: Optional[List[Dict[str, Any]]] = None   # 각 조합(행) 정보
-_product_tags: Dict[str, Set[str]] = {}              # 상품명 -> 태그들
-_product_coocc: Dict[str, Dict[str, int]] = {}       # 상품 co-occurrence (지금은 사용 안 해도 됨)
+_combo_rows: Optional[List[Dict[str, Any]]] = None
+_product_tags: Dict[str, Set[str]] = {}
+_product_coocc: Dict[str, Dict[str, int]] = {}
+
 
 # ---------------------------------------------------------
-# 기본 선호 정보
+# 기본 타입 정의
 # ---------------------------------------------------------
 
 @dataclass
@@ -57,6 +59,7 @@ class UserPreferences:
 
 @dataclass
 class Intent:
+    """사용자 발화에서 추출한 의도/상황 정보."""
     mood_tags: Set[str]
     taste_tags: Set[str]
     need_alcohol: bool
@@ -65,10 +68,11 @@ class Intent:
 
 
 # ---------------------------------------------------------
-# 로딩 유틸
+# CU 상품 로딩
 # ---------------------------------------------------------
 
 def _load_cu_products() -> Tuple[pd.DataFrame, Dict[str, Dict[str, Any]]]:
+    """CU 상품 CSV 로드 + 이름→상품정보 매핑 생성."""
     global _cu_df, _cu_name_map
     if _cu_df is not None and _cu_name_map is not None:
         return _cu_df, _cu_name_map
@@ -96,47 +100,51 @@ def _load_cu_products() -> Tuple[pd.DataFrame, Dict[str, Dict[str, Any]]]:
 
 
 # ---------------------------------------------------------
-# 텍스트/이름 정규화 및 다이어트/라면 필터용 유틸
+# 텍스트/이름 정규화 & 필터 관련 유틸
 # ---------------------------------------------------------
 
 _NON_FOOD_KEYWORDS = [
     "수면안대", "수면 안대", "인형", "키링", "피규어", "텀블러", "파일",
-    "노트", "샤프", "샤프펜", "스티커", "문구", "양말"
+    "노트", "샤프", "샤프펜", "스티커", "문구", "양말",
 ]
 
 _CARB_RICH_NAME_KEYWORDS = [
     "밥", "김밥", "주먹밥", "도시락", "라이스", "볶음밥", "비빔밥",
-    "빵", "버거", "토스트", "파스타", "스파게티", "면", "누들", "떡볶이", "떡", "만두", "피자"
+    "빵", "버거", "토스트", "파스타", "스파게티", "면", "누들",
+    "떡볶이", "떡", "만두", "피자",
 ]
 
 _PROTEIN_NAME_KEYWORDS = [
     "닭가슴살", "닭가슴", "닭 안심", "계란", "란", "프로틴", "단백질",
-    "그릭요거트", "요거트", "두부", "콩", "참치", "연어", "고등어", "햄", "소시지", "소세지", "치즈"
+    "그릭요거트", "요거트", "두부", "콩", "참치", "연어", "고등어",
+    "햄", "소시지", "소세지", "치즈",
 ]
 
 _NEUTRAL_NAME_KEYWORDS = [
     "샐러드", "야채", "채소", "야채스틱", "샐러드볼", "샐러드 볼",
-    "오이", "토마토", "당근", "물", "생수", "워터", "제로", "0kcal", "블랙커피", "아메리카노"
+    "오이", "토마토", "당근", "물", "생수", "워터", "제로",
+    "0kcal", "블랙커피", "아메리카노",
 ]
 
 _RAMEN_NAME_PATTERNS = [
-    r"라면", r"컵라면", r"볶음면", r"우동", r"라멘", r"모밀", r"쫄면", r"누들"
+    r"라면", r"컵라면", r"볶음면", r"우동", r"라멘", r"모밀", r"쫄면", r"누들",
 ]
 
 _DIET_KEYWORDS = [
-    "다이어트", "살 빼", "칼로리", "살찔", "살 찔", "저칼로리", "헬스", "운동 후"
+    "다이어트", "살 빼", "칼로리", "살찔", "살 찔", "저칼로리", "헬스", "운동 후",
 ]
 
 _ALCOHOL_TEXT_KEYWORDS = [
-    "술", "맥주", "소주", "와인", "하이볼", "칵테일", "한잔", "한 잔", "막걸리"
+    "술", "맥주", "소주", "와인", "하이볼", "칵테일", "한잔", "한 잔", "막걸리",
 ]
 
 _HUNGER_KEYWORDS = [
-    "배고파", "배 고파", "출출", "밥 먹고 싶", "밥 뭐 먹", "공복", "식사", "한끼", "한 끼"
+    "배고파", "배 고파", "출출", "밥 먹고 싶", "밥 뭐 먹", "공복", "식사", "한끼", "한 끼",
 ]
 
 
 def _normalize_price(p: Optional[Any]) -> Optional[int]:
+    """가격 문자열 → int 변환."""
     if p is None:
         return None
     try:
@@ -146,15 +154,17 @@ def _normalize_price(p: Optional[Any]) -> Optional[int]:
 
 
 def _normalize_name_for_match(s: str) -> str:
+    """상품명 매칭용 정규화(괄호/공백/기호 제거 + 소문자)."""
     if not isinstance(s, str):
         return ""
-    s = re.sub(r"\([^)]*\)", "", s)      # 괄호 내용 제거
-    s = re.sub(r"[\s·]+", "", s)         # 공백/중점 제거
+    s = re.sub(r"\([^)]*\)", "", s)
+    s = re.sub(r"[\s·]+", "", s)
     s = re.sub(r"[^0-9A-Za-z가-힣]", "", s)
     return s.lower()
 
 
 def _is_food_item(name: str, main_category: Optional[str]) -> bool:
+    """생활용품/문구 등을 걸러내는 비식품 판별."""
     if main_category == "생활용품":
         return False
     for kw in _NON_FOOD_KEYWORDS:
@@ -164,12 +174,12 @@ def _is_food_item(name: str, main_category: Optional[str]) -> bool:
 
 
 def _is_diet_friendly_items_strict(items: List[ComboItem]) -> bool:
+    """다이어트 모드에서 허용할 수 있는 조합인지 검사."""
     has_protein = False
     for it in items:
         name = it.name or ""
-        for kw in _CARB_RICH_NAME_KEYWORDS:
-            if kw in name:
-                return False
+        if any(kw in name for kw in _CARB_RICH_NAME_KEYWORDS):
+            return False
         is_protein = any(kw in name for kw in _PROTEIN_NAME_KEYWORDS)
         is_neutral = any(kw in name for kw in _NEUTRAL_NAME_KEYWORDS)
         if is_protein:
@@ -182,19 +192,20 @@ def _is_diet_friendly_items_strict(items: List[ComboItem]) -> bool:
 
 
 # ---------------------------------------------------------
-# combo CSV → 상품 매핑 + 태그 + coocc 빌드
+# 콤보 CSV → 상품 매핑 + 태그/공동출현 빌드
 # ---------------------------------------------------------
 
 def _split_products_field(text: Any) -> List[str]:
+    """콤보 CSV의 '주요 상품/보조 상품' 필드를 개별 상품명 리스트로 분리."""
     if not isinstance(text, str):
         return []
-    # 콤마/·/+/그리고/및 등으로 대충 쪼갬
     text = text.replace(" 및 ", ",").replace(" 와 ", ",").replace("랑", ",")
     parts = re.split(r"[,/·+]|그리고|&", text)
     return [p.strip() for p in parts if p.strip()]
 
 
 def _match_to_cu_product(raw_name: str, cu_norm_list: List[Tuple[str, str]]) -> Optional[str]:
+    """콤보 상품명 → CU 실제 상품명으로 매칭."""
     norm = _normalize_name_for_match(raw_name)
     if not norm:
         return None
@@ -204,7 +215,6 @@ def _match_to_cu_product(raw_name: str, cu_norm_list: List[Tuple[str, str]]) -> 
     for name, n in cu_norm_list:
         if not n:
             continue
-        # 부분 문자열 매칭
         if norm in n or n in norm:
             score = min(len(norm), len(n))
             if score > best_score:
@@ -215,26 +225,21 @@ def _match_to_cu_product(raw_name: str, cu_norm_list: List[Tuple[str, str]]) -> 
 
 
 def _extract_tags_from_combo_text(keywords: str, category: str) -> Set[str]:
+    """콤보 설명/카테고리 텍스트에서 분위기·맛 태그 추출."""
     text = f"{keywords} {category}"
     tags: Set[str] = set()
 
-    # 기본 분위기/상황
     if any(kw in text for kw in ["스트레스", "짜증", "열받", "화나", "빡치", "멘붕", "꿀꿀", "우울"]):
         tags.add(TAG_STRESS)
     if any(kw in text for kw in ["비 오는 날", "비오는 날", "비 오는", "빗소리", "꿀꿀한 날씨", "우중충"]):
-        tags.add(TAG_RAINY)
-        tags.add(TAG_HOT_SOUP)
-        tags.add(TAG_COMFORT)
+        tags.update({TAG_RAINY, TAG_HOT_SOUP, TAG_COMFORT})
 
-    # 맛/식사 관련
     if any(kw in text for kw in ["맵", "매운", "매콤", "불닭", "청양", "화끈", "마라"]):
         tags.add(TAG_SPICY)
     if any(kw in text for kw in ["달콤", "달달", "당 충전", "초코", "디저트"]):
-        tags.add(TAG_SWEET)
-        tags.add(TAG_DESSERT)
+        tags.update({TAG_SWEET, TAG_DESSERT})
     if any(kw in text for kw in ["국물", "탕", "찌개", "해장", "따끈한", "따뜻함", "추운 날"]):
-        tags.add(TAG_HOT_SOUP)
-        tags.add(TAG_COMFORT)
+        tags.update({TAG_HOT_SOUP, TAG_COMFORT})
     if any(kw in text for kw in ["술", "맥주", "소주", "막걸리", "안주", "혼술"]):
         tags.add(TAG_ALCOHOL)
     if any(kw in text for kw in ["한 끼", "한끼", "식사", "든든한", "밥", "간편 식사", "라면/분식"]):
@@ -242,22 +247,20 @@ def _extract_tags_from_combo_text(keywords: str, category: str) -> Set[str]:
     if any(kw in text for kw in ["단백질", "닭가슴살", "다이어트", "헬스", "운동 후"]):
         tags.add(TAG_PROTEIN)
 
-    # 카테고리 기반
     if "술안주" in category:
         tags.add(TAG_ALCOHOL)
     if "라면/분식" in category:
-        tags.add(TAG_MEAL)
-        tags.add(TAG_SPICY)  # 대충 많이 매워서…
+        tags.update({TAG_MEAL, TAG_SPICY})
     if "간편 식사" in category or "식사" in category:
         tags.add(TAG_MEAL)
     if "디저트" in category:
-        tags.add(TAG_SWEET)
-        tags.add(TAG_DESSERT)
+        tags.update({TAG_SWEET, TAG_DESSERT})
 
     return tags
 
 
 def _ensure_combo_knowledge_built():
+    """combination + synthetic CSV를 읽어 콤보/상품 태그/공동출현 정보 캐싱."""
     global _combo_rows, _product_tags, _product_coocc
 
     if _combo_rows is not None:
@@ -269,7 +272,6 @@ def _ensure_combo_knowledge_built():
         for row in df_cu.itertuples(index=False)
     ]
 
-    # combo + synthetic 합치기
     df_list = []
     if os.path.exists(COMB_PATH):
         df_list.append(pd.read_csv(COMB_PATH))
@@ -306,19 +308,15 @@ def _ensure_combo_knowledge_built():
             if matched and matched not in cu_items:
                 cu_items.append(matched)
 
-        # 최소 2개 이상 CU 상품으로 매핑된 조합만 사용 (진짜 꿀조합 느낌)
+        # 실제 CU 상품 최소 2개 이상 매핑되는 조합만 사용
         if len(cu_items) < 2:
             continue
 
         combo_tags = _extract_tags_from_combo_text(keywords, category_raw)
 
-        # 상품 태그 누적
         for pname in cu_items:
-            if pname not in product_tags:
-                product_tags[pname] = set()
-            product_tags[pname].update(combo_tags)
+            product_tags.setdefault(pname, set()).update(combo_tags)
 
-        # co-occurrence 누적
         for i in range(len(cu_items)):
             for j in range(i + 1, len(cu_items)):
                 a, b = cu_items[i], cu_items[j]
@@ -358,6 +356,7 @@ _NEGATIVE_RAMEN_PATTERNS = [
 
 
 def analyze_user_intent(text: str) -> Intent:
+    """발화에서 기분/맛/술/식사/다이어트 여부를 추출."""
     t = text.strip()
 
     mood_tags: Set[str] = set()
@@ -366,39 +365,33 @@ def analyze_user_intent(text: str) -> Intent:
     diet_mode = False
     need_meal = False
 
-    # 우울/스트레스/꿀꿀
-    LOW_MOOD_KEYWORDS = [
+    low_mood_keywords = [
         "스트레스", "짜증", "열받", "화나", "빡치", "멘붕",
-        "꿀꿀", "우울", "기분 별로", "기분이 별로"
+        "꿀꿀", "우울", "기분 별로", "기분이 별로",
     ]
-    if any(kw in t for kw in LOW_MOOD_KEYWORDS):
+    if any(kw in t for kw in low_mood_keywords):
         mood_tags.add(TAG_STRESS)
         taste_tags.update([TAG_SPICY, TAG_SWEET])
 
-    # 비/우중충
-    RAINY_KEYWORDS = [
+    rainy_keywords = [
         "비도 오고", "비 와", "비와", "비 오", "비오는", "비 오는",
-        "우중충", "우중충하네", "우울한 날"
+        "우중충", "우중충하네", "우울한 날",
     ]
-    if any(kw in t for kw in RAINY_KEYWORDS):
+    if any(kw in t for kw in rainy_keywords):
         mood_tags.add(TAG_RAINY)
         taste_tags.add(TAG_HOT_SOUP)
 
-    # 직접적인 맛
     if "매운" in t or "매콤" in t or "얼얼" in t:
         taste_tags.add(TAG_SPICY)
     if "달달" in t or "달콤" in t or "당충전" in t:
         taste_tags.add(TAG_SWEET)
 
-    # 술은 텍스트에 있을 때만
     if any(kw in t for kw in _ALCOHOL_TEXT_KEYWORDS):
         need_alcohol = True
 
-    # 배고픔/식사
     if any(kw in t for kw in _HUNGER_KEYWORDS):
         need_meal = True
 
-    # 다이어트
     if any(kw in t for kw in _DIET_KEYWORDS):
         diet_mode = True
 
@@ -412,8 +405,9 @@ def analyze_user_intent(text: str) -> Intent:
 
 
 def infer_category_from_text(user_text: str) -> Optional[str]:
+    """발화에서 선호 카테고리(식사/라면/안주/디저트)를 추론."""
     t = user_text.strip()
-    if re.search(r"식사|한끼|끼니|밥|도시락|주먹밥|샌드위치|점심|저녁|아침", t):
+    if re.search(r"식사|한끼|끼니|밥|도시락|주먹밥|샌드위치|점심|저녁|अ침", t):
         return "식사류"
     if re.search(r"라면|분식|떡볶이|우동|국물", t):
         return "라면/분식"
@@ -425,6 +419,7 @@ def infer_category_from_text(user_text: str) -> Optional[str]:
 
 
 def parse_user_preferences(user_text: str) -> UserPreferences:
+    """사용자 발화에서 금지 카테고리/다이어트/선호 카테고리/술 허용 여부 추출."""
     text = user_text or ""
 
     banned_categories: List[str] = []
@@ -436,8 +431,7 @@ def parse_user_preferences(user_text: str) -> UserPreferences:
     allow_alcohol = any(kw in text for kw in _ALCOHOL_TEXT_KEYWORDS)
 
     if preferred_category is None:
-        hunger = any(kw in text for kw in _HUNGER_KEYWORDS)
-        if hunger and not allow_alcohol:
+        if any(kw in text for kw in _HUNGER_KEYWORDS) and not allow_alcohol:
             preferred_category = "식사류"
 
     return UserPreferences(
@@ -456,29 +450,23 @@ def apply_negative_preferences_and_diet(
         combo: HoneyCombo,
         prefs: UserPreferences,
 ) -> Optional[HoneyCombo]:
-    # 술안주인데 술 허용 X
+    """사용자 제약 조건을 적용해 콤보를 필터링."""
     if combo.category == "술안주/야식" and not prefs.allow_alcohol:
         return None
 
-    # 카테고리 차원에서 금지
     if combo.category in prefs.banned_categories:
         return None
 
-    # 라면/분식 금지인 경우, 상품명에 라면/면류 있으면 제거
     if "라면/분식" in prefs.banned_categories:
         for it in combo.items:
             name = it.name or ""
-            for pat in _RAMEN_NAME_PATTERNS:
-                if re.search(pat, name):
-                    return None
+            if any(re.search(pat, name) for pat in _RAMEN_NAME_PATTERNS):
+                return None
 
-    # 비식품 제거
     filtered_items: List[ComboItem] = []
     for it in combo.items:
-        main_cat = it.main_category
-        if not _is_food_item(it.name, main_cat):
-            continue
-        filtered_items.append(it)
+        if _is_food_item(it.name, it.main_category):
+            filtered_items.append(it)
 
     if len(filtered_items) < 2:
         return None
@@ -486,19 +474,18 @@ def apply_negative_preferences_and_diet(
     combo.items = filtered_items
     combo.total_price = _normalize_price(sum(i.price or 0 for i in filtered_items))
 
-    # 다이어트 모드: 엄격하게 단백질/중성 위주만
-    if prefs.diet_mode:
-        if not _is_diet_friendly_items_strict(combo.items):
-            return None
+    if prefs.diet_mode and not _is_diet_friendly_items_strict(combo.items):
+        return None
 
     return combo
 
 
 # ---------------------------------------------------------
-# combo 카테고리/타이틀 처리
+# 콤보 카테고리/타이틀 처리
 # ---------------------------------------------------------
 
 def _normalize_combo_category(category_raw: str) -> str:
+    """콤보 CSV의 카테고리 문자열을 내부 공통 카테고리로 정규화."""
     if "술안주" in category_raw:
         return "술안주/야식"
     if "라면" in category_raw or "분식" in category_raw:
@@ -511,17 +498,17 @@ def _normalize_combo_category(category_raw: str) -> str:
 
 
 def _build_combo_title(user_text: str, intent: Intent, original_name: str) -> str:
+    """사용자 상황에 맞는 조합 이름을 생성(없으면 원래 이름 사용)."""
     text = user_text
 
     if any(kw in text for kw in ["스트레스", "꿀꿀", "우울", "기분 별로", "기분이 별로"]):
         if TAG_SPICY in intent.taste_tags and TAG_SWEET in intent.taste_tags:
             return "꿀꿀한 날 매콤달콤 스트레스 해소 세트"
-        elif TAG_SPICY in intent.taste_tags:
+        if TAG_SPICY in intent.taste_tags:
             return "꿀꿀한 날 매운 스트레스 해소 세트"
-        elif TAG_SWEET in intent.taste_tags:
+        if TAG_SWEET in intent.taste_tags:
             return "꿀꿀한 날 달달한 위로 세트"
-        else:
-            return "꿀꿀한 날 위로가 되는 한 상"
+        return "꿀꿀한 날 위로가 되는 한 상"
 
     if any(kw in text for kw in ["비도 오고", "비 와", "비와", "비 오", "비오는", "비 오는", "우중충"]):
         return "비 오는 날 따뜻한 한 끼"
@@ -532,12 +519,11 @@ def _build_combo_title(user_text: str, intent: Intent, original_name: str) -> st
     if any(kw in text for kw in ["배고파", "출출", "한끼", "한 끼", "밥 뭐", "밥 먹고"]):
         return "출출할 때 든든한 한 끼"
 
-    # 기본은 원래 조합 이름 사용
     return original_name
 
 
 # ---------------------------------------------------------
-# combo 데이터셋 기반 추천 (진짜로 1100개에서 고름)
+# 콤보 데이터셋 기반 추천
 # ---------------------------------------------------------
 
 def _score_combo_for_intent(
@@ -546,55 +532,47 @@ def _score_combo_for_intent(
         prefs: UserPreferences,
         user_text: str,
 ) -> float:
+    """콤보 한 개가 현재 의도/선호에 얼마나 잘 맞는지 점수화."""
     tags = combo_row["tags"]
     category_raw = combo_row["category_raw"]
     keywords = combo_row["keywords"]
 
     score = 0.0
-
-    # 맛/상황 태그 매칭
     score += len(tags & intent.taste_tags) * 2.0
     score += len(tags & intent.mood_tags) * 1.5
 
-    # 술 필요
     if intent.need_alcohol:
         if TAG_ALCOHOL in tags or "술안주" in category_raw:
             score += 2.0
         else:
             score -= 1.0
     else:
-        # 술안주 조합은 기본적으로 약간 페널티
         if "술안주" in category_raw:
             score -= 0.5
 
-    # 식사 느낌
     if intent.need_meal:
         if "식사" in category_raw or "라면/분식" in category_raw or TAG_MEAL in tags:
             score += 1.0
 
-    # 선호 카테고리
     if prefs.preferred_category and prefs.preferred_category in category_raw:
         score += 1.0
 
-    # 라면/분식 금지
     if "라면/분식" in prefs.banned_categories and "라면" in category_raw:
         score -= 100.0
 
-    # 텍스트 키워드 간단 매칭
-    # ex) "비도 오고" / "비 오는 날"
     text = user_text
-    if "비도 오고" in text or "비 와" in text or "비와" in text or "비 오는" in text:
+    if any(kw in text for kw in ["비도 오고", "비 와", "비와", "비 오", "비오는", "비 오는"]):
         if "비 오는 날" in keywords or "비오는 날" in keywords:
             score += 2.0
-        if "국물" in keywords or "탕" in keywords or "찌개" in keywords:
+        if any(kw in keywords for kw in ["국물", "탕", "찌개"]):
             score += 1.0
 
     if any(kw in text for kw in ["스트레스", "꿀꿀", "우울"]):
-        if "스트레스" in keywords or "우울할 때" in keywords or "꿀꿀한" in keywords:
+        if any(kw in keywords for kw in ["스트레스", "우울할 때", "꿀꿀한"]):
             score += 2.0
         if "매운맛" in keywords or "극강의 매운맛" in keywords:
             score += 1.0
-        if "당 충전" in keywords or "초콜릿" in keywords or "디저트" in keywords:
+        if any(kw in keywords for kw in ["당 충전", "초콜릿", "디저트"]):
             score += 1.0
 
     return score
@@ -606,6 +584,7 @@ def _build_honey_combo_from_combo_row(
         intent: Intent,
         prefs: UserPreferences,
 ) -> Optional[HoneyCombo]:
+    """콤보 한 행(row)을 HoneyCombo 객체로 변환 + 사용자 제약 적용."""
     _, cu_map = _load_cu_products()
 
     items: List[ComboItem] = []
@@ -643,8 +622,7 @@ def _build_honey_combo_from_combo_row(
         generated=False,
     )
 
-    combo = apply_negative_preferences_and_diet(combo, prefs)
-    return combo
+    return apply_negative_preferences_and_diet(combo, prefs)
 
 
 def recommend_combos_from_dataset(
@@ -653,29 +631,24 @@ def recommend_combos_from_dataset(
         prefs: UserPreferences,
         top_k: int = 10,
 ) -> List[HoneyCombo]:
+    """콤보 데이터셋(실제+synthetic)에서 현재 상황에 맞는 조합을 top_k개 추천."""
     _ensure_combo_knowledge_built()
     if not _combo_rows:
         return []
 
     scored: List[Tuple[float, Dict[str, Any]]] = []
-
     for row in _combo_rows:
         s = _score_combo_for_intent(row, intent, prefs, user_text)
-        if s <= 0:
-            # 완전히 안 맞으면 버림
-            continue
-        scored.append((s, row))
+        if s > 0:
+            scored.append((s, row))
 
-    # 만약 점수 난 게 아무것도 없으면, 그냥 전체 중에서 가성비 좋은 조합 몇 개
     if not scored:
         fallback: List[Tuple[float, Dict[str, Any]]] = []
         for row in _combo_rows:
-            # 술/라면 금지 최소한만 반영
             if not prefs.allow_alcohol and "술안주" in row["category_raw"]:
                 continue
             if "라면/분식" in prefs.banned_categories and "라면" in row["category_raw"]:
                 continue
-            # 상품 가격 합 기준으로 점수 (싼 게 더 높은 점수)
             combo = _build_honey_combo_from_combo_row(row, user_text, intent, prefs)
             if not combo:
                 continue
@@ -690,7 +663,7 @@ def recommend_combos_from_dataset(
     scored.sort(key=lambda x: x[0], reverse=True)
 
     results: List[HoneyCombo] = []
-    for s, row in scored:
+    for _, row in scored:
         combo = _build_honey_combo_from_combo_row(row, user_text, intent, prefs)
         if combo is None:
             continue
@@ -702,7 +675,7 @@ def recommend_combos_from_dataset(
 
 
 # ---------------------------------------------------------
-# 외부에 노출되는 함수들 (컨트롤러에서 사용)
+# 컨트롤러에서 사용하는 공개 함수
 # ---------------------------------------------------------
 
 def recommend_combos_openai_rag(
@@ -710,10 +683,7 @@ def recommend_combos_openai_rag(
         top_k: int,
         filters: UserPreferences,
 ) -> List[HoneyCombo]:
-    """
-    이름은 그대로 두지만, 실제로는 OpenAI RAG가 아니라
-    combo CSV(실제+synthetic)에서 직접 고르는 함수.
-    """
+    """이름은 그대로 두고, combo CSV 기반 추천 엔진을 래핑."""
     intent = analyze_user_intent(user_text)
     return recommend_combos_from_dataset(user_text, intent, filters, top_k=top_k)
 
@@ -724,8 +694,5 @@ def generate_combos_product2vec(
         max_new: int,
         filters: UserPreferences,
 ) -> List[HoneyCombo]:
-    """
-    지금 단계에서는 '데이터셋에 없는 조합'은 만들지 않도록 비워둠.
-    추후 원하시면 co-occ 그래프 기반으로 살짝 변형한 생성형 버전도 추가 가능.
-    """
+    """현재는 product2vec 생성형을 사용하지 않고, API 호환만 유지."""
     return []
