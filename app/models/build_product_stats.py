@@ -10,19 +10,11 @@ import pandas as pd
 # ---------------------------------------------------------
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
-
 DATA_DIR = os.path.join(BASE_DIR, "data")
-PRECOMPUTED_DIR = os.path.join(BASE_DIR, "precomputed")
 
 COMB_PATH = os.path.join(DATA_DIR, "combination.csv")
 SYN_PATH = os.path.join(DATA_DIR, "synthetic_honey_combos_1000.csv")
 CU_PRODUCTS_PATH = os.path.join(DATA_DIR, "cu_official_products.csv")
-
-PRODUCT_TAGS_PATH = os.path.join(PRECOMPUTED_DIR, "product_tags.json")
-COOCC_PATH = os.path.join(PRECOMPUTED_DIR, "product_cooccurrence.json")
-
-os.makedirs(PRECOMPUTED_DIR, exist_ok=True)
-
 # ---------------------------------------------------------
 # 태그 정의 (콤보 기반)
 # ---------------------------------------------------------
