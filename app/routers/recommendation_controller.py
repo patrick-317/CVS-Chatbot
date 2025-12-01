@@ -1,20 +1,19 @@
-from typing import List, Dict, Any
+from typing import Any, Dict, List
 
 from fastapi import APIRouter
 
 from app.services.recommendation_service import (
-    recommend_combos_openai_rag,
     parse_user_preferences,
+    recommend_combos_openai_rag,
     generate_combos_product2vec,
     UserPreferences,
 )
 
-# 카카오 오픈빌더에서 설정한 스킬 URL: /api/v1/kakao/recommend
 router = APIRouter(prefix="/api/v1/kakao", tags=["recommendation"])
 
 
 # ---------------------------------------------------------
-# Quick Reply 빌더
+# Quick Reply
 # ---------------------------------------------------------
 
 
@@ -39,11 +38,11 @@ def _build_quick_replies(user_text: str) -> List[Dict[str, Any]]:
 
 
 # ---------------------------------------------------------
-# Kakao ItemCard / SimpleText 변환 (딕셔너리 기반)
+# Kakao 응답 빌더 (dict 기반)
 # ---------------------------------------------------------
 
 
-def _combo_to_itemcard(combo) -> Dict[str, Any]:
+def _combo_to_itemcard_dict(combo) -> Dict[str, Any]:
     head = {
         "title": combo.name,
         "description": f"{combo.category} · 약 {combo.total_price or 0:,}원",
@@ -56,7 +55,6 @@ def _combo_to_itemcard(combo) -> Dict[str, Any]:
             {
                 "title": f"{i}. {it.name}",
                 "description": price_txt,
-                "imageUrl": None,
             }
         )
 
@@ -66,7 +64,7 @@ def _combo_to_itemcard(combo) -> Dict[str, Any]:
     }
 
 
-def _build_simple_text(
+def _build_simple_text_str(
         user_text: str,
         main_combo,
         others: List[Any],
@@ -93,11 +91,6 @@ def _build_simple_text(
     return "\n".join(lines)
 
 
-# ---------------------------------------------------------
-# 실패 응답
-# ---------------------------------------------------------
-
-
 def _build_fail_response(user_text: str) -> Dict[str, Any]:
     return {
         "version": "2.0",
@@ -119,32 +112,31 @@ def _build_fail_response(user_text: str) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------
-# 메인 엔드포인트 (스키마 없이 dict로 처리)
+# 메인 엔드포인트
 # ---------------------------------------------------------
 
 
 @router.post("/recommend")
 async def recommend(body: Dict[str, Any]) -> Dict[str, Any]:
     """
-    카카오 오픈빌더용 편의점 꿀조합 추천 엔드포인트.
+    카카오 오픈빌더용 편의점 꿀조합 추천 엔드포인트
     POST /api/v1/kakao/recommend
     """
-    user_req = (body.get("userRequest") or {})
+    user_req = body.get("userRequest") or {}
     utterance = (user_req.get("utterance") or "").strip()
-
     user_text = utterance or "편의점 꿀조합 추천해줘"
 
     # 1) 유저 선호 파싱
     prefs: UserPreferences = parse_user_preferences(user_text)
 
-    # 2) combo CSV 기반 후보
+    # 2) combo CSV 기반 후보 (RAG-lite 역할)
     rag_combos = recommend_combos_openai_rag(
         user_text=user_text,
         top_k=10,
         filters=prefs,
     )
 
-    # 3) product2vec 기반 생성 (현재는 비워둔 상태일 수 있음)
+    # 3) product2vec 기반 생성형 조합 (있으면 추가)
     gen_combos = generate_combos_product2vec(
         user_text=user_text,
         base_candidates=rag_combos,
@@ -152,6 +144,7 @@ async def recommend(body: Dict[str, Any]) -> Dict[str, Any]:
         filters=prefs,
     )
 
+    # 4) 결과 합치기
     all_combos = gen_combos + rag_combos
 
     if not all_combos:
@@ -160,20 +153,21 @@ async def recommend(body: Dict[str, Any]) -> Dict[str, Any]:
     main_combo = all_combos[0]
     others = all_combos[1:4]
 
-    item_card_dict = _combo_to_itemcard(main_combo)
-    simple_text_str = _build_simple_text(user_text, main_combo, others)
+    item_card_dict = _combo_to_itemcard_dict(main_combo)
+    simple_text_str = _build_simple_text_str(user_text, main_combo, others)
 
+    # Kakao 규격: outputs 배열의 각 element는 하나의 키만 가져야 함
     response: Dict[str, Any] = {
         "version": "2.0",
         "template": {
             "outputs": [
                 {
-                    "itemCard": item_card_dict,
-                    "simpleText": None,
+                    "itemCard": item_card_dict
                 },
                 {
-                    "simpleText": {"text": simple_text_str},
-                    "itemCard": None,
+                    "simpleText": {
+                        "text": simple_text_str
+                    }
                 },
             ],
             "quickReplies": _build_quick_replies(user_text),
