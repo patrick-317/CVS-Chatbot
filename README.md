@@ -34,7 +34,7 @@ uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 POST /api/v1/kakao/recommend
 
 요청 바디 예시
-
+<details> <summary><strong>펼치기 / 접기</strong></summary>
 {
   "intent": {
     "id": "test_intent_1",
@@ -69,11 +69,12 @@ POST /api/v1/kakao/recommend
     "detailParams": {}
   }
 }
+</details>
 
 ---
 
 응답 예시
-
+<details> <summary><strong>펼치기 / 접기</strong></summary>
 curl -X 'POST' \
   'http://IP주소:8000/api/v1/kakao/recommend' \
   -H 'accept: application/json' \
@@ -112,4 +113,5 @@ curl -X 'POST' \
     "detailParams": {}
   }
 }
+</details>
 '
