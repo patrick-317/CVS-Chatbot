@@ -3,8 +3,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 
 from app.routers import recommendation_controller
+from app.services.recommendation_service import warmup_models
 
 load_dotenv()
+warmup_models()
 
 app = FastAPI(title="CVS Honey Combo Chatbot API")
 

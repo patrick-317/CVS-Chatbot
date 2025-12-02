@@ -141,7 +141,7 @@ async def recommend(body: Dict[str, Any]) -> Dict[str, Any]:
     # (2) CSV 기반 RAG 후보
     rag_combos = recommend_combos_openai_rag(
         user_text=user_text,
-        top_k=10,
+        top_k=5,
         filters=prefs,
     )
 
@@ -149,7 +149,7 @@ async def recommend(body: Dict[str, Any]) -> Dict[str, Any]:
     gen_combos = generate_combos_product2vec(
         user_text=user_text,
         base_candidates=rag_combos,
-        max_new=0,
+        max_new=1,
         filters=prefs,
     )
 
@@ -174,3 +174,4 @@ async def recommend(body: Dict[str, Any]) -> Dict[str, Any]:
             "quickReplies": _build_quick_replies(user_text),
         },
     }
+
