@@ -2,12 +2,11 @@ import os
 import re
 import json
 import math
-import asyncio
 from dataclasses import dataclass
 from typing import List, Dict, Tuple, Optional, Any, Set
 
 import pandas as pd
-from openai import AsyncOpenAI
+from openai import OpenAI
 
 from app.schemas.recommendation_model import HoneyCombo, ComboItem
 
@@ -53,18 +52,21 @@ _product_coocc: Dict[str, Dict[str, int]] = {}
 
 _combo_embeddings: Optional[List[List[float]]] = None
 
-_openai_client: Optional[AsyncOpenAI] = None
+_openai_client: Optional[OpenAI] = None
 
 
-def _get_openai_client() -> Optional[AsyncOpenAI]:
+def _get_openai_client() -> Optional[OpenAI]:
     """OpenAI 클라이언트 (API 키 없으면 None)."""
     global _openai_client
+
     if _openai_client is not None:
         return _openai_client
+
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         return None
-    _openai_client = AsyncOpenAI(api_key=api_key)
+
+    _openai_client = OpenAI(api_key=api_key)
     return _openai_client
 
 
@@ -94,8 +96,9 @@ class Intent:
 # ---------------------------------------------------------
 
 def _load_cu_products() -> Tuple[pd.DataFrame, Dict[str, Dict[str, Any]]]:
-    """CU 상품 CSV 로드 + 이름→상품정보 매핑."""
+    """CU 상품 CSV 로드 + 이름 → 상품정보 매핑."""
     global _cu_df, _cu_name_map
+
     if _cu_df is not None and _cu_name_map is not None:
         return _cu_df, _cu_name_map
 
@@ -177,8 +180,8 @@ def _normalize_price(p: Optional[Any]) -> Optional[int]:
 def _normalize_name_for_match(s: str) -> str:
     if not isinstance(s, str):
         return ""
-    s = re.sub(r"\([^)]*\)", "", s)
-    s = re.sub(r"[\s·]+", "", s)
+    s = re.sub(r"\([^)]*\)", "", s)       # 괄호 내용 제거
+    s = re.sub(r"[\s·]+", "", s)          # 공백/중점 제거
     s = re.sub(r"[^0-9A-Za-z가-힣]", "", s)
     return s.lower()
 
@@ -193,6 +196,7 @@ def _is_food_item(name: str, main_category: Optional[str]) -> bool:
 
 
 def _is_diet_friendly_items_strict(items: List[ComboItem]) -> bool:
+    """다이어트 모드일 때 사용할 엄격한 필터."""
     has_protein = False
     for it in items:
         name = it.name or ""
@@ -205,6 +209,7 @@ def _is_diet_friendly_items_strict(items: List[ComboItem]) -> bool:
             continue
         if is_neutral:
             continue
+        # 탄수/지방도 아니고 단백질/중성도 아니면 탈락
         return False
     return has_protein
 
@@ -244,11 +249,13 @@ def _extract_tags_from_combo_text(keywords: str, category: str) -> Set[str]:
     text = f"{keywords} {category}"
     tags: Set[str] = set()
 
+    # 기분/상황
     if any(kw in text for kw in ["스트레스", "짜증", "열받", "화나", "빡치", "멘붕", "꿀꿀", "우울"]):
         tags.add(TAG_STRESS)
     if any(kw in text for kw in ["비 오는 날", "비오는 날", "비 오는", "빗소리", "꿀꿀한 날씨", "우중충"]):
         tags.update({TAG_RAINY, TAG_HOT_SOUP, TAG_COMFORT})
 
+    # 맛/식사
     if any(kw in text for kw in ["맵", "매운", "매콤", "불닭", "청양", "화끈", "마라"]):
         tags.add(TAG_SPICY)
     if any(kw in text for kw in ["달콤", "달달", "당 충전", "초코", "디저트"]):
@@ -262,6 +269,7 @@ def _extract_tags_from_combo_text(keywords: str, category: str) -> Set[str]:
     if any(kw in text for kw in ["단백질", "닭가슴살", "다이어트", "헬스", "운동 후"]):
         tags.add(TAG_PROTEIN)
 
+    # 카테고리 기반 보정
     if "술안주" in category:
         tags.add(TAG_ALCOHOL)
     if "라면/분식" in category:
@@ -275,7 +283,7 @@ def _extract_tags_from_combo_text(keywords: str, category: str) -> Set[str]:
 
 
 def _ensure_combo_knowledge_built():
-    """combination + synthetic CSV를 한 번만 파싱."""
+    """combination + synthetic CSV를 한 번만 파싱해서 메모리에 올린다."""
     global _combo_rows, _product_tags, _product_coocc
 
     if _combo_rows is not None:
@@ -323,14 +331,17 @@ def _ensure_combo_knowledge_built():
             if matched and matched not in cu_items:
                 cu_items.append(matched)
 
+        # 최소 2개 CU 상품이 매칭되는 조합만 사용
         if len(cu_items) < 2:
             continue
 
         combo_tags = _extract_tags_from_combo_text(keywords, category_raw)
 
+        # 상품별 태그
         for pname in cu_items:
             product_tags.setdefault(pname, set()).update(combo_tags)
 
+        # 공동 출현 카운트
         for i in range(len(cu_items)):
             for j in range(i + 1, len(cu_items)):
                 a, b = cu_items[i], cu_items[j]
@@ -369,19 +380,39 @@ def _build_combo_embedding_text(row: Dict[str, Any]) -> str:
     return " | ".join(p for p in parts if p)
 
 
-async def _ensure_combo_embeddings_built_async():
-    """콤보 전체 임베딩 미리 계산."""
+def _ensure_combo_embeddings_built():
+    """콤보 전체 임베딩을 한 번만 계산."""
     global _combo_embeddings
+
+    client = _get_openai_client()
+    if client is None:
+        return
+    if _combo_embeddings is not None:
+        return
 
     _ensure_combo_knowledge_built()
     if not _combo_rows:
         _combo_embeddings = []
         return
 
-    if _combo_embeddings is not None:
-        return
+    texts = [_build_combo_embedding_text(r) for r in _combo_rows]
+    embeddings: List[List[float]] = []
 
-    _combo_embeddings = []
+    batch_size = 64
+    for i in range(0, len(texts), batch_size):
+        batch = texts[i:i + batch_size]
+        try:
+            resp = client.embeddings.create(
+                model=OPENAI_EMBED_MODEL,
+                input=batch,
+            )
+            for d in resp.data:
+                embeddings.append(d.embedding)
+        except Exception:
+            _combo_embeddings = []
+            return
+
+    _combo_embeddings = embeddings
 
 
 def _cosine_sim(a: List[float], b: List[float]) -> float:
@@ -395,12 +426,12 @@ def _cosine_sim(a: List[float], b: List[float]) -> float:
     return dot / (na * nb)
 
 
-async def _embed_text_async(text: str) -> Optional[List[float]]:
+def _embed_text(text: str) -> Optional[List[float]]:
     client = _get_openai_client()
     if client is None:
         return None
     try:
-        resp = await client.embeddings.create(
+        resp = client.embeddings.create(
             model=OPENAI_EMBED_MODEL,
             input=[text],
         )
@@ -449,9 +480,9 @@ def analyze_user_intent_rule(text: str) -> Intent:
         mood_tags.add(TAG_RAINY)
         taste_tags.add(TAG_HOT_SOUP)
 
-    if "매운" in t or "매콤" in t or "얼얼" in t:
+    if any(kw in t for kw in ["매운", "매콤", "얼얼"]):
         taste_tags.add(TAG_SPICY)
-    if "달달" in t or "달콤" in t or "당충전" in t:
+    if any(kw in t for kw in ["달달", "달콤", "당충전"]):
         taste_tags.add(TAG_SWEET)
 
     if any(kw in t for kw in _ALCOHOL_TEXT_KEYWORDS):
@@ -472,7 +503,7 @@ def analyze_user_intent_rule(text: str) -> Intent:
     )
 
 
-async def analyze_user_intent_llm_async(text: str) -> Optional[Intent]:
+def analyze_user_intent_llm(text: str) -> Optional[Intent]:
     """LLM을 사용한 보조 intent 추론."""
     client = _get_openai_client()
     if client is None:
@@ -490,7 +521,7 @@ async def analyze_user_intent_llm_async(text: str) -> Optional[Intent]:
     )
 
     try:
-        resp = await client.chat.completions.create(
+        resp = client.chat.completions.create(
             model=OPENAI_CHAT_MODEL,
             messages=[
                 {"role": "system", "content": system_msg},
@@ -512,18 +543,10 @@ async def analyze_user_intent_llm_async(text: str) -> Optional[Intent]:
         return None
 
 
-async def analyze_user_intent_async(text: str) -> Intent:
+def analyze_user_intent(text: str) -> Intent:
     """규칙 + LLM을 합쳐서 최종 intent 생성."""
     base = analyze_user_intent_rule(text)
-
-    llm_task = asyncio.create_task(analyze_user_intent_llm_async(text))
-
-    try:
-        llm = await asyncio.wait_for(llm_task, timeout=2.5)
-    except asyncio.TimeoutError:
-        llm = None
-    except Exception:
-        llm = None
+    llm = analyze_user_intent_llm(text)
 
     if llm is None:
         return base
@@ -584,18 +607,22 @@ def apply_negative_preferences_and_diet(
         prefs: UserPreferences,
 ) -> Optional[HoneyCombo]:
     """사용자 제약을 적용해 콤보를 필터."""
+    # 술안주인데 술 허용 X
     if combo.category == "술안주/야식" and not prefs.allow_alcohol:
         return None
 
+    # 카테고리 금지
     if combo.category in prefs.banned_categories:
         return None
 
+    # 라면/분식 금지인데 상품명에 라면/면류 포함
     if "라면/분식" in prefs.banned_categories:
         for it in combo.items:
             name = it.name or ""
             if any(re.search(pat, name) for pat in _RAMEN_NAME_PATTERNS):
                 return None
 
+    # 비식품 제거
     filtered_items: List[ComboItem] = []
     for it in combo.items:
         if _is_food_item(it.name, it.main_category):
@@ -607,6 +634,7 @@ def apply_negative_preferences_and_diet(
     combo.items = filtered_items
     combo.total_price = _normalize_price(sum(i.price or 0 for i in filtered_items))
 
+    # 다이어트 모드
     if prefs.diet_mode and not _is_diet_friendly_items_strict(combo.items):
         return None
 
@@ -633,12 +661,12 @@ def _normalize_combo_category(category_raw: str) -> str:
 # 콤보 이름 직접 조회 (이름/임베딩)
 # ---------------------------------------------------------
 
-async def _find_combo_by_name_or_embedding_async(user_text: str, user_emb: Optional[List[float]]) -> Optional[Dict[str, Any]]:
+def _find_combo_by_name_or_embedding(user_text: str) -> Optional[Dict[str, Any]]:
     """
-    '밴쯔 정식', '인싸력 폭발', '앙버터 토스트'처럼
-    실제 조합 이름을 입력했을 때 해당 콤보 row를 찾아준다.
-    1순위: 이름 문자열 포함/일치
-    2순위: 임베딩 기반 의미 유사도 (threshold 이상)
+    '밴쯔 정식', '인싸력 폭발'처럼 실제 조합 이름을 입력했을 때
+    해당 콤보 row를 찾아준다.
+    1순위: 이름 문자열 매칭
+    2순위: 임베딩 기반 의미 유사도
     """
     _ensure_combo_knowledge_built()
     if not _combo_rows:
@@ -648,7 +676,7 @@ async def _find_combo_by_name_or_embedding_async(user_text: str, user_emb: Optio
     if not t:
         return None
 
-    # 1) 문자열 기반
+    # 1) 문자열 매칭
     best_row: Optional[Dict[str, Any]] = None
     best_len = 0
     for row in _combo_rows:
@@ -667,11 +695,12 @@ async def _find_combo_by_name_or_embedding_async(user_text: str, user_emb: Optio
     if best_row is not None:
         return best_row
 
-    # 2) 임베딩 기반 (OpenAI 사용 가능할 때만)
-    await _ensure_combo_embeddings_built_async()
+    # 2) 임베딩 기반
+    _ensure_combo_embeddings_built()
     if not _combo_embeddings:
         return None
 
+    user_emb = _embed_text(t)
     if user_emb is None:
         return None
 
@@ -709,9 +738,12 @@ def _score_combo_for_intent(
     keywords = combo_row["keywords"]
 
     score = 0.0
+
+    # 태그 매칭
     score += len(tags & intent.taste_tags) * 2.0
     score += len(tags & intent.mood_tags) * 1.5
 
+    # 술
     if intent.need_alcohol:
         if TAG_ALCOHOL in tags or "술안주" in category_raw:
             score += 2.0
@@ -721,16 +753,20 @@ def _score_combo_for_intent(
         if "술안주" in category_raw:
             score -= 0.5
 
+    # 식사
     if intent.need_meal:
         if "식사" in category_raw or "라면/분식" in category_raw or TAG_MEAL in tags:
             score += 1.0
 
+    # 선호 카테고리
     if prefs.preferred_category and prefs.preferred_category in category_raw:
         score += 1.0
 
+    # 라면 금지
     if "라면/분식" in prefs.banned_categories and "라면" in category_raw:
         score -= 100.0
 
+    # 텍스트 키워드 매칭
     text = user_text
     if any(kw in text for kw in ["비도 오고", "비 와", "비와", "비 오", "비오는", "비 오는"]):
         if "비 오는 날" in keywords or "비오는 날" in keywords:
@@ -746,6 +782,7 @@ def _score_combo_for_intent(
         if any(kw in keywords for kw in ["당 충전", "초콜릿", "디저트"]):
             score += 1.0
 
+    # 임베딩 유사도
     if user_emb is not None and combo_emb is not None:
         sim = _cosine_sim(user_emb, combo_emb)
         score += sim * 3.0
@@ -761,8 +798,7 @@ def _build_honey_combo_from_combo_row(
 ) -> Optional[HoneyCombo]:
     """
     CSV row → HoneyCombo 변환.
-    여기서 combo.name 은 항상 CSV의 "조합 이름"을 그대로 사용한다.
-    (사용자가 나중에 이름으로 다시 검색할 수 있도록)
+    combo.name 은 CSV의 조합 이름을 그대로 사용한다.
     """
     _, cu_map = _load_cu_products()
 
@@ -803,11 +839,10 @@ def _build_honey_combo_from_combo_row(
     return apply_negative_preferences_and_diet(combo, prefs)
 
 
-async def recommend_combos_from_dataset_async(
+def recommend_combos_from_dataset(
         user_text: str,
         intent: Intent,
         prefs: UserPreferences,
-        user_emb: Optional[List[float]],
         top_k: int = 10,
 ) -> List[HoneyCombo]:
     """콤보 데이터셋 전체에서 현재 상황에 맞는 조합 top_k개 선택."""
@@ -815,7 +850,8 @@ async def recommend_combos_from_dataset_async(
     if not _combo_rows:
         return []
 
-    await _ensure_combo_embeddings_built_async()
+    _ensure_combo_embeddings_built()
+    user_emb = _embed_text(user_text) if _combo_embeddings else None
 
     scored: List[Tuple[float, Dict[str, Any], Optional[List[float]]]] = []
     for idx, row in enumerate(_combo_rows):
@@ -826,6 +862,7 @@ async def recommend_combos_from_dataset_async(
         if s > 0:
             scored.append((s, row, combo_emb))
 
+    # 아무것도 안 맞으면 가성비 fallback
     if not scored:
         fallback: List[Tuple[float, Dict[str, Any]]] = []
         for row in _combo_rows:
@@ -867,9 +904,9 @@ def _sample_candidate_products_for_llm(
         prefs: UserPreferences,
         max_candidates: int = 60,
 ) -> List[Dict[str, Any]]:
-    """LLM이 새 조합을 만들 때 사용할 후보 상품 리스트."""
+    """LLM이 새 조합을 만들 때 사용할 후보 상품 목록."""
+    _ensure_combo_knowledge_built()
     df_cu, _ = _load_cu_products()
-
     candidates: List[Dict[str, Any]] = []
 
     for row in df_cu.itertuples(index=False):
@@ -877,26 +914,24 @@ def _sample_candidate_products_for_llm(
         main_cat = row.main_category
         price = int(row.price)
 
-        if not prefs.allow_alcohol and any(kw in name for kw in ["맥주", "소주", "와인", "막걸리", "하이볼"]):
+        # 술 허용 안 하면 주류 제거
+        if not prefs.allow_alcohol and any(x in name for x in ["맥주", "소주", "와인", "막걸리", "하이볼"]):
             continue
 
+        # 라면 제외
         if "라면/분식" in prefs.banned_categories:
-            if any(re.search(pat, name) for pat in _RAMEN_NAME_PATTERNS):
+            if any(re.search(p, name) for p in _RAMEN_NAME_PATTERNS):
                 continue
 
         if not _is_food_item(name, main_cat):
             continue
 
-        tag_list = list(_product_tags.get(name, []))
-
-        candidates.append(
-            {
-                "name": name,
-                "main_category": main_cat,
-                "price": price,
-                "tags": tag_list,
-            }
-        )
+        candidates.append({
+            "name": name,
+            "main_category": main_cat,
+            "price": price,
+            "tags": list(_product_tags.get(name, [])),
+        })
 
     return candidates[:max_candidates]
 
@@ -908,56 +943,52 @@ def _build_llm_combo_prompt(
         products: List[Dict[str, Any]],
         max_new: int,
 ) -> str:
-    """신규 꿀조합 생성을 위한 LLM 프롬프트를 만든다."""
-    header = (
-        "너는 CU 편의점 상품 목록을 가지고 꿀조합 세트를 설계하는 역할이야.\n\n"
-        f"사용자 문장: {user_text}\n\n"
+    """신규 꿀조합 생성을 위한 LLM 프롬프트."""
+    rules = (
         "규칙:\n"
-        "- 각 조합은 2~4개의 상품으로 구성해.\n"
-        "- 반드시 아래 리스트에 있는 상품에서만 선택해.\n"
-        "- 다이어트 모드면 단백질/샐러드/제로 음료 위주로.\n"
-        "- 라면/분식 금지면 라면/면/우동/컵라면 사용 금지.\n"
-        "- 술 언급이 없으면 주류 포함 금지.\n"
-        "- 조합 이름은 한국어로 간단히.\n\n"
-        f"선호 태그: mood_tags={list(intent.mood_tags)}, "
-        f"taste_tags={list(intent.taste_tags)}, "
-        f"diet_mode={intent.diet_mode}, need_meal={intent.need_meal}, "
-        f"allow_alcohol={prefs.allow_alcohol}\n\n"
+        "- 각 조합은 반드시 2~4개의 상품으로 구성.\n"
+        "- 반드시 아래 제공된 상품 리스트에서만 선택.\n"
+        "- 다이어트면 단백질/샐러드/제로 음료 중심으로.\n"
+        "- 라면 제외면 면류 금지.\n"
+        "- 술 언급 없으면 주류 금지.\n"
+        "- 조합 이름은 짧은 한국어로.\n"
     )
 
-    example_json_format = (
-        '[{"name": "조합 이름", "products": ["상품1", "상품2"]}]\n'
-    )
+    example_format = '[{"name": "조합 이름", "products": ["상품1", "상품2"]}]'
 
     return (
-            header
+            f"사용자 입력: {user_text}\n\n"
+            + rules
+            + f"선호 태그: mood={list(intent.mood_tags)}, "
+              f"taste={list(intent.taste_tags)}, "
+              f"diet={intent.diet_mode}, meal={intent.need_meal}, "
+              f"allow_alcohol={prefs.allow_alcohol}\n\n"
             + "상품 목록(JSON):\n"
             + json.dumps(products, ensure_ascii=False, indent=2)
-            + "\n\n"
-            + f"이 중에서 최대 {max_new}개 조합을 만들어.\n"
+            + f"\n\n위 상품들을 조합해 최대 {max_new}개의 꿀조합을 만들어줘.\n"
             + "반드시 아래 형식의 JSON만 출력해.\n"
-            + example_json_format
+            + example_format
     )
-
 
 
 def _category_from_items(
-        items: List[Dict[str, Any]],
+        items: List[ComboItem],
         prefs: UserPreferences,
         intent: Intent,
 ) -> str:
-    """신규 조합의 카테고리 추정."""
-    main_cats = {it.get("main_category", "") for it in items}
-    name_join = " ".join(it.get("name", "") for it in items)
+    """신규 조합의 카테고리를 추정."""
+    names = " ".join(it.name or "" for it in items)
+    cats = {it.main_category or "" for it in items}
 
-    if any(kw in name_join for kw in ["맥주", "소주", "와인", "막걸리", "하이볼"]):
+    if any(x in names for x in ["맥주", "소주", "와인", "막걸리"]):
         return "술안주/야식"
-    if any(cat for cat in main_cats if "라면" in cat or "분식" in cat):
+    if any("라면" in c or "분식" in c for c in cats):
         return "라면/분식"
-    if any(cat for cat in main_cats if "식사" in cat):
+    if any("식사" in c for c in cats):
         return "식사류"
-    if any(cat for cat in main_cats if "디저트" in cat or "아이스크림" in cat):
+    if any("디저트" in c or "아이스크림" in c for c in cats):
         return "디저트"
+
     if prefs.preferred_category:
         return prefs.preferred_category
     if intent.need_meal:
@@ -965,7 +996,7 @@ def _category_from_items(
     return "기타"
 
 
-async def generate_combos_product2vec_async(
+def generate_combos_product2vec(
         user_text: str,
         base_candidates: List[HoneyCombo],
         max_new: int,
@@ -974,13 +1005,12 @@ async def generate_combos_product2vec_async(
     """
     GPT 기반 실시간 신규 조합 생성.
     기존 product2vec 자리를 대체하지만 시그니처는 그대로 유지.
-    실패하면 빈 리스트만 반환.
     """
     client = _get_openai_client()
     if client is None or max_new <= 0:
         return []
 
-    intent = await analyze_user_intent_async(user_text)
+    intent = analyze_user_intent(user_text)
     candidate_products = _sample_candidate_products_for_llm(intent, filters)
     if not candidate_products:
         return []
@@ -988,13 +1018,13 @@ async def generate_combos_product2vec_async(
     prompt = _build_llm_combo_prompt(user_text, intent, filters, candidate_products, max_new)
 
     try:
-        resp = await client.chat.completions.create(
+        resp = client.chat.completions.create(
             model=OPENAI_CHAT_MODEL,
             messages=[
                 {"role": "system", "content": "CU 편의점 꿀조합을 설계하는 AI 어시스턴트야."},
                 {"role": "user", "content": prompt},
             ],
-            temperature=0.7,
+            temperature=0.6,
         )
         content = resp.choices[0].message.content.strip()
         combos_json = json.loads(content)
@@ -1002,8 +1032,14 @@ async def generate_combos_product2vec_async(
         return []
 
     df_cu, _ = _load_cu_products()
-    cu_map = {str(r.name): {"name": r.name, "price": int(r.price), "main_category": r.main_category}
-              for r in df_cu.itertuples(index=False)}
+    cu_map = {
+        str(r.name): {
+            "name": r.name,
+            "price": int(r.price),
+            "main_category": r.main_category,
+        }
+        for r in df_cu.itertuples(index=False)
+    }
 
     name_to_prod: Dict[str, Dict[str, Any]] = {p["name"]: p for p in candidate_products}
 
@@ -1023,12 +1059,9 @@ async def generate_combos_product2vec_async(
         total_price = 0
 
         for pn in prod_names:
-            prod_info = name_to_prod.get(pn)
+            prod_info = name_to_prod.get(pn) or cu_map.get(pn)
             if prod_info is None:
-                cu_info = cu_map.get(pn)
-                if cu_info is None:
-                    continue
-                prod_info = cu_info
+                continue
 
             name = prod_info["name"]
             main_cat = prod_info.get("main_category", "기타")
@@ -1048,11 +1081,7 @@ async def generate_combos_product2vec_async(
         if len(items) < 2:
             continue
 
-        category = _category_from_items(
-            [{"name": it.name, "main_category": it.main_category} for it in items],
-            filters,
-            intent,
-        )
+        category = _category_from_items(items, filters, intent)
 
         combo = HoneyCombo(
             id=-1000 - idx,
@@ -1074,36 +1103,28 @@ async def generate_combos_product2vec_async(
 
 
 # ---------------------------------------------------------
-# 컨트롤러에서 사용하는 공개 함수
+# 최종 추천 로직 (컨트롤러에서 호출)
 # ---------------------------------------------------------
 
-async def recommend_combos_openai_rag_async(
+def recommend_combos_openai_rag(
         user_text: str,
         top_k: int,
         filters: UserPreferences,
 ) -> List[HoneyCombo]:
     """
-    1) 사용자가 실제 꿀조합 이름을 말한 경우
-       → 그 조합을 그대로 찾아서 메인으로 반환
+    1) 사용자가 실제 꿀조합 이름을 말한 경우 → 그 조합을 메인으로 반환
     2) 아니면 일반 문장 기반 추천 (의도 + Embedding + 태그 스코어)
     """
-    intent_task = analyze_user_intent_async(user_text)
-    embed_task = _embed_text_async(user_text)
+    intent = analyze_user_intent(user_text)
 
-    intent, user_emb = await asyncio.gather(intent_task, embed_task)
-
-    combo_row = await _find_combo_by_name_or_embedding_async(user_text, user_emb)
-    if combo_row is not None:
-        main_combo = _build_honey_combo_from_combo_row(combo_row, user_text, intent, filters)
-        if main_combo is not None:
-            others: List[HoneyCombo] = []
-            candidates = await recommend_combos_from_dataset_async(user_text, intent, filters, user_emb, top_k=top_k + 3)
-            for c in candidates:
-                if c.id == main_combo.id:
-                    continue
-                others.append(c)
-                if len(others) >= max(0, top_k - 1):
-                    break
+    # 1) 조합 이름 직접 입력 ("밴쯔 정식", "앙버터 토스트" 등)
+    name_hit = _find_combo_by_name_or_embedding(user_text)
+    if name_hit:
+        main_combo = _build_honey_combo_from_combo_row(name_hit, user_text, intent, filters)
+        if main_combo:
+            others_raw = recommend_combos_from_dataset(user_text, intent, filters, top_k=top_k + 3)
+            others = [c for c in others_raw if c.id != main_combo.id][:max(0, top_k - 1)]
             return [main_combo] + others
 
-    return await recommend_combos_from_dataset_async(user_text, intent, filters, user_emb, top_k=top_k)
+    # 2) 일반 문장 입력 → 조합 추천
+    return recommend_combos_from_dataset(user_text, intent, filters, top_k=top_k)
