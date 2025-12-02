@@ -141,7 +141,7 @@ async def recommend(body: Dict[str, Any]) -> Dict[str, Any]:
     # (2) CSV 기반 RAG 후보
     rag_combos = recommend_combos_openai_rag(
         user_text=user_text,
-        top_k=5,
+        top_k=3,
         filters=prefs,
     )
 
