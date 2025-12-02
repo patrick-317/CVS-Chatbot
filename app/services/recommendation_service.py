@@ -2,11 +2,12 @@ import os
 import re
 import json
 import math
+import asyncio
 from dataclasses import dataclass
 from typing import List, Dict, Tuple, Optional, Any, Set
 
 import pandas as pd
-from openai import OpenAI
+from openai import AsyncOpenAI
 
 from app.schemas.recommendation_model import HoneyCombo, ComboItem
 
@@ -52,10 +53,10 @@ _product_coocc: Dict[str, Dict[str, int]] = {}
 
 _combo_embeddings: Optional[List[List[float]]] = None
 
-_openai_client: Optional[OpenAI] = None
+_openai_client: Optional[AsyncOpenAI] = None
 
 
-def _get_openai_client() -> Optional[OpenAI]:
+def _get_openai_client() -> Optional[AsyncOpenAI]:
     """OpenAI 클라이언트 (API 키 없으면 None)."""
     global _openai_client
     if _openai_client is not None:
@@ -63,7 +64,7 @@ def _get_openai_client() -> Optional[OpenAI]:
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         return None
-    _openai_client = OpenAI(api_key=api_key)
+    _openai_client = AsyncOpenAI(api_key=api_key)
     return _openai_client
 
 
@@ -368,38 +369,19 @@ def _build_combo_embedding_text(row: Dict[str, Any]) -> str:
     return " | ".join(p for p in parts if p)
 
 
-def _ensure_combo_embeddings_built():
+async def _ensure_combo_embeddings_built_async():
     """콤보 전체 임베딩 미리 계산."""
     global _combo_embeddings
-    client = _get_openai_client()
-    if client is None:
-        return
-    if _combo_embeddings is not None:
-        return
 
     _ensure_combo_knowledge_built()
     if not _combo_rows:
         _combo_embeddings = []
         return
 
-    texts = [_build_combo_embedding_text(r) for r in _combo_rows]
-    embeddings: List[List[float]] = []
+    if _combo_embeddings is not None:
+        return
 
-    batch_size = 64
-    for i in range(0, len(texts), batch_size):
-        batch = texts[i:i + batch_size]
-        try:
-            resp = client.embeddings.create(
-                model=OPENAI_EMBED_MODEL,
-                input=batch,
-            )
-            for d in resp.data:
-                embeddings.append(d.embedding)
-        except Exception:
-            _combo_embeddings = []
-            return
-
-    _combo_embeddings = embeddings
+    _combo_embeddings = []
 
 
 def _cosine_sim(a: List[float], b: List[float]) -> float:
@@ -413,12 +395,12 @@ def _cosine_sim(a: List[float], b: List[float]) -> float:
     return dot / (na * nb)
 
 
-def _embed_text(text: str) -> Optional[List[float]]:
+async def _embed_text_async(text: str) -> Optional[List[float]]:
     client = _get_openai_client()
     if client is None:
         return None
     try:
-        resp = client.embeddings.create(
+        resp = await client.embeddings.create(
             model=OPENAI_EMBED_MODEL,
             input=[text],
         )
@@ -490,7 +472,7 @@ def analyze_user_intent_rule(text: str) -> Intent:
     )
 
 
-def analyze_user_intent_llm(text: str) -> Optional[Intent]:
+async def analyze_user_intent_llm_async(text: str) -> Optional[Intent]:
     """LLM을 사용한 보조 intent 추론."""
     client = _get_openai_client()
     if client is None:
@@ -508,7 +490,7 @@ def analyze_user_intent_llm(text: str) -> Optional[Intent]:
     )
 
     try:
-        resp = client.chat.completions.create(
+        resp = await client.chat.completions.create(
             model=OPENAI_CHAT_MODEL,
             messages=[
                 {"role": "system", "content": system_msg},
@@ -530,10 +512,18 @@ def analyze_user_intent_llm(text: str) -> Optional[Intent]:
         return None
 
 
-def analyze_user_intent(text: str) -> Intent:
+async def analyze_user_intent_async(text: str) -> Intent:
     """규칙 + LLM을 합쳐서 최종 intent 생성."""
     base = analyze_user_intent_rule(text)
-    llm = analyze_user_intent_llm(text)
+
+    llm_task = asyncio.create_task(analyze_user_intent_llm_async(text))
+
+    try:
+        llm = await asyncio.wait_for(llm_task, timeout=2.5)
+    except asyncio.TimeoutError:
+        llm = None
+    except Exception:
+        llm = None
 
     if llm is None:
         return base
@@ -643,7 +633,7 @@ def _normalize_combo_category(category_raw: str) -> str:
 # 콤보 이름 직접 조회 (이름/임베딩)
 # ---------------------------------------------------------
 
-def _find_combo_by_name_or_embedding(user_text: str) -> Optional[Dict[str, Any]]:
+async def _find_combo_by_name_or_embedding_async(user_text: str, user_emb: Optional[List[float]]) -> Optional[Dict[str, Any]]:
     """
     '밴쯔 정식', '인싸력 폭발', '앙버터 토스트'처럼
     실제 조합 이름을 입력했을 때 해당 콤보 row를 찾아준다.
@@ -678,11 +668,10 @@ def _find_combo_by_name_or_embedding(user_text: str) -> Optional[Dict[str, Any]]
         return best_row
 
     # 2) 임베딩 기반 (OpenAI 사용 가능할 때만)
-    _ensure_combo_embeddings_built()
+    await _ensure_combo_embeddings_built_async()
     if not _combo_embeddings:
         return None
 
-    user_emb = _embed_text(t)
     if user_emb is None:
         return None
 
@@ -814,10 +803,11 @@ def _build_honey_combo_from_combo_row(
     return apply_negative_preferences_and_diet(combo, prefs)
 
 
-def recommend_combos_from_dataset(
+async def recommend_combos_from_dataset_async(
         user_text: str,
         intent: Intent,
         prefs: UserPreferences,
+        user_emb: Optional[List[float]],
         top_k: int = 10,
 ) -> List[HoneyCombo]:
     """콤보 데이터셋 전체에서 현재 상황에 맞는 조합 top_k개 선택."""
@@ -825,8 +815,7 @@ def recommend_combos_from_dataset(
     if not _combo_rows:
         return []
 
-    _ensure_combo_embeddings_built()
-    user_emb = _embed_text(user_text) if _combo_embeddings else None
+    await _ensure_combo_embeddings_built_async()
 
     scored: List[Tuple[float, Dict[str, Any], Optional[List[float]]]] = []
     for idx, row in enumerate(_combo_rows):
@@ -976,7 +965,7 @@ def _category_from_items(
     return "기타"
 
 
-def generate_combos_product2vec(
+async def generate_combos_product2vec_async(
         user_text: str,
         base_candidates: List[HoneyCombo],
         max_new: int,
@@ -991,7 +980,7 @@ def generate_combos_product2vec(
     if client is None or max_new <= 0:
         return []
 
-    intent = analyze_user_intent(user_text)
+    intent = await analyze_user_intent_async(user_text)
     candidate_products = _sample_candidate_products_for_llm(intent, filters)
     if not candidate_products:
         return []
@@ -999,7 +988,7 @@ def generate_combos_product2vec(
     prompt = _build_llm_combo_prompt(user_text, intent, filters, candidate_products, max_new)
 
     try:
-        resp = client.chat.completions.create(
+        resp = await client.chat.completions.create(
             model=OPENAI_CHAT_MODEL,
             messages=[
                 {"role": "system", "content": "CU 편의점 꿀조합을 설계하는 AI 어시스턴트야."},
@@ -1088,7 +1077,7 @@ def generate_combos_product2vec(
 # 컨트롤러에서 사용하는 공개 함수
 # ---------------------------------------------------------
 
-def recommend_combos_openai_rag(
+async def recommend_combos_openai_rag_async(
         user_text: str,
         top_k: int,
         filters: UserPreferences,
@@ -1098,14 +1087,17 @@ def recommend_combos_openai_rag(
        → 그 조합을 그대로 찾아서 메인으로 반환
     2) 아니면 일반 문장 기반 추천 (의도 + Embedding + 태그 스코어)
     """
-    intent = analyze_user_intent(user_text)
+    intent_task = analyze_user_intent_async(user_text)
+    embed_task = _embed_text_async(user_text)
 
-    combo_row = _find_combo_by_name_or_embedding(user_text)
+    intent, user_emb = await asyncio.gather(intent_task, embed_task)
+
+    combo_row = await _find_combo_by_name_or_embedding_async(user_text, user_emb)
     if combo_row is not None:
         main_combo = _build_honey_combo_from_combo_row(combo_row, user_text, intent, filters)
         if main_combo is not None:
             others: List[HoneyCombo] = []
-            candidates = recommend_combos_from_dataset(user_text, intent, filters, top_k=top_k + 3)
+            candidates = await recommend_combos_from_dataset_async(user_text, intent, filters, user_emb, top_k=top_k + 3)
             for c in candidates:
                 if c.id == main_combo.id:
                     continue
@@ -1114,4 +1106,4 @@ def recommend_combos_openai_rag(
                     break
             return [main_combo] + others
 
-    return recommend_combos_from_dataset(user_text, intent, filters, top_k=top_k)
+    return await recommend_combos_from_dataset_async(user_text, intent, filters, user_emb, top_k=top_k)
