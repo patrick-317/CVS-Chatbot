@@ -22,7 +22,7 @@ CU_PRODUCTS_PATH = os.path.join(DATA_DIR, "cu_official_products.csv")
 COMB_PATH = os.path.join(DATA_DIR, "combination.csv")
 SYN_PATH = os.path.join(DATA_DIR, "synthetic_honey_combos_1000.csv")
 
-OPENAI_CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-4.1-mini")
+OPENAI_CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-5.1")
 OPENAI_EMBED_MODEL = os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-small")
 
 # 태그 상수
