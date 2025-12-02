@@ -149,7 +149,7 @@ async def recommend(body: Dict[str, Any]) -> Dict[str, Any]:
     gen_combos = generate_combos_product2vec(
         user_text=user_text,
         base_candidates=rag_combos,
-        max_new=3,
+        max_new=0,
         filters=prefs,
     )
 
