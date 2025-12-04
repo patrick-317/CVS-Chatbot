@@ -59,7 +59,7 @@ def _combo_to_itemcard_dict(combo) -> Dict[str, Any]:
         items.append(
             {
                 "title": f"{i}",
-                "description": f"{it.name} · {price_txt}",
+                "description": f"{it.name}",
             }
         )
 
