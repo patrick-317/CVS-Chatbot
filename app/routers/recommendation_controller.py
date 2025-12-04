@@ -58,8 +58,8 @@ def _combo_to_itemcard_dict(combo) -> Dict[str, Any]:
         price_txt = f"{it.price:,}원" if it.price else "가격 정보 없음"
         items.append(
             {
-                "title": f"{i}. {it.name}",
-                "description": price_txt,
+                "title": f"{i}",
+                "description": f"{it.name} · {price_txt}",
             }
         )
 
