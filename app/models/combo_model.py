@@ -31,24 +31,6 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 def combos_from_df(df: pd.DataFrame) -> List[List[str]]:
-    """
-    combination.csv / synthetic_honey_combos_1000.csv 공통 스키마:
-
-    컬럼:
-      - '조합 이름'
-      - '편의점'
-      - '주요 상품'
-      - '보조 상품(들)'
-      - '키워드 / 상황'
-      - '카테고리'
-      - '원문 URL (출처)'
-
-    여기서:
-      - '주요 상품'  → 반드시 1개 상품
-      - '보조 상품(들)' → "A, B, C" 처럼 콤마로 구분된 상품들
-
-    → 각 row 를 ["주요 상품", "보조1", "보조2", ...] 형태의 시퀀스로 변환
-    """
     main_col = "주요 상품"
     sub_col = "보조 상품(들)"
 
@@ -61,22 +43,18 @@ def combos_from_df(df: pd.DataFrame) -> List[List[str]]:
     for _, row in df.iterrows():
         items: List[str] = []
 
-        # 1) 주요 상품
         main = str(row.get(main_col, "")).strip()
         if main and main.lower() != "nan":
             items.append(main)
 
-        # 2) 보조 상품(들) - 콤마 기준으로 나눔
         subs_raw = str(row.get(sub_col, "")).strip()
         if subs_raw and subs_raw.lower() != "nan":
             parts = [p.strip() for p in subs_raw.split(",") if p.strip()]
             items.extend(parts)
 
-        # 3) 최소 2개 이상이어야 "조합"으로 의미가 있음
         if len(items) < 2:
             continue
 
-        # 4) 중복 제거(순서 유지)
         uniq: List[str] = []
         seen = set()
         for it in items:
@@ -91,9 +69,6 @@ def combos_from_df(df: pd.DataFrame) -> List[List[str]]:
 
 
 def load_sentences() -> List[List[str]]:
-    """
-    실제/AI 조합 둘 다 로드해서 하나의 코퍼스로 사용
-    """
     print("[product2vec] COMB_PATH =", COMB_PATH)
     print("[product2vec] SYN_PATH  =", SYN_PATH)
 
@@ -119,7 +94,6 @@ class Product2VecDataset(Dataset):
         self.data: List[Tuple[int, int]] = []
         self.vocab = vocab
 
-        # (center, context) 쌍 생성
         for sent in sentences:
             idxs = [vocab[w] for w in sent if w in vocab]
             for i, center in enumerate(idxs):
@@ -140,13 +114,6 @@ class Product2VecDataset(Dataset):
 
 
 class Product2Vec(nn.Module):
-    """
-    아주 단순한 product2vec (word2vec 유사 구조)
-    - in_emb: center
-    - out_emb: context
-    - 손실: (dot(center, context) - 1)^2
-    """
-
     def __init__(self, vocab_size: int, emb_dim: int):
         super().__init__()
         self.in_emb = nn.Embedding(vocab_size, emb_dim)
@@ -205,7 +172,6 @@ def train():
             optimizer.zero_grad()
             logits = model(center_idx, target_idx)  # (B,)
 
-            # target dot-product 를 1에 가깝게
             loss = ((logits - 1.0) ** 2).mean()
             loss.backward()
             optimizer.step()
@@ -214,7 +180,6 @@ def train():
 
         print(f"[product2vec] epoch {epoch + 1}/{EPOCHS}, loss = {total_loss:.4f}")
 
-    # CPU로 임베딩 추출
     with torch.no_grad():
         emb = model.in_emb.weight.detach().cpu().clone()
 

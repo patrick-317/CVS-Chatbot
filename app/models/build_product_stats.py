@@ -86,21 +86,13 @@ _RAINY_KEYWORDS = [
 # ---------------------------------------------------------
 
 def normalize_name(name: str) -> str:
-    """
-    CU 상품명 / 콤보 상품명을 동일 규칙으로 정규화.
-    - 괄호/특수문자 제거
-    - 브랜드 접두어(샐, 면, 주, 도, 피치 등) 제거
-    - 소문자 + 공백 축소
-    """
     if not isinstance(name, str):
         name = str(name)
     s = name.lower()
-    # 괄호 내용/기호 제거
     s = re.sub(r"[\(\)\[\]{}]", " ", s)
     s = re.sub(r"[^0-9a-z가-힣 ]", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
 
-    # 자주 등장하는 접두 브랜드 제거
     brands = ["샐", "면", "주", "도", "피치", "t1", "gs", "씨유"]
     for b in brands:
         s = s.replace(b.lower() + " ", "")
@@ -111,12 +103,6 @@ def normalize_name(name: str) -> str:
 
 
 def load_cu_products() -> Dict[str, str]:
-    """
-    CU 상품 CSV를 읽어서
-    - 원래 이름: name
-    - 정규화 이름: normalize_name(name)
-    으로 딕셔너리 생성.
-    """
     cu_df = pd.read_csv(CU_PRODUCTS_PATH)
     cu_norm_map: Dict[str, str] = {}
 
@@ -125,7 +111,6 @@ def load_cu_products() -> Dict[str, str]:
         normed = normalize_name(original)
         if not normed:
             continue
-        # 같은 norm 키에 여러 개가 매핑될 수 있지만, 일단 최초 1개만 사용
         cu_norm_map.setdefault(normed, original)
 
     print(f"[build_product_stats] CU products = {len(cu_df)}, norm keys = {len(cu_norm_map)}")
@@ -133,37 +118,28 @@ def load_cu_products() -> Dict[str, str]:
 
 
 def match_items_to_cu(items: List[str], cu_norm_map: Dict[str, str]) -> List[str]:
-    """
-    콤보 CSV에서 뽑은 raw item 리스트를
-    CU 상품명(norm map)으로 매핑.
-    """
     matched: List[str] = []
     for raw in items:
         normed = normalize_name(raw)
         if not normed:
             continue
 
-        # 1차: 완전 일치
         if normed in cu_norm_map:
             name = cu_norm_map[normed]
             if name not in matched:
                 matched.append(name)
             continue
 
-        # 2차: 부분 문자열 매칭
-        # ex) "불닭볶음면" ⊂ "오리지널불닭볶음면"
         candidates = [
             (k, v) for k, v in cu_norm_map.items()
             if normed in k or k in normed
         ]
         if candidates:
-            # 그냥 첫 번째 후보 사용 (필요하면 더 정교하게 가능)
             _, name = candidates[0]
             if name not in matched:
                 matched.append(name)
             continue
 
-        # 3차: 못 맞추는 경우는 버림
     return matched
 
 # ---------------------------------------------------------
@@ -179,25 +155,19 @@ def load_combo_df(path: str) -> pd.DataFrame:
 
 
 def parse_items_from_row(row: pd.Series) -> List[str]:
-    """
-    콤보 CSV 한 줄에서 상품 리스트만 뽑기.
-    기본 가정: 'items' 컬럼에 "상품1 + 상품2 + 상품3" 형태.
-    없으면 'item', '상품'으로 시작하는 컬럼들을 모두 모음.
-    """
     cols = row.index
 
     if "items" in cols:
         raw = str(row["items"]) if not pd.isna(row["items"]) else ""
         if not raw:
             return []
-        # '+', ',', '|' 기준으로 split
         for sep in ["+", ",", "|", "/"]:
             if sep in raw:
                 parts = [p.strip() for p in raw.split(sep)]
                 return [p for p in parts if p]
         return [raw.strip()] if raw.strip() else []
 
-    # fallback: item1, item2, 상품1, 상품2 ...
+
     item_names: List[str] = []
     for c in cols:
         cl = str(c).lower()
@@ -212,10 +182,6 @@ def parse_items_from_row(row: pd.Series) -> List[str]:
 
 
 def extract_combo_text(row: pd.Series) -> str:
-    """
-    콤보 이름/카테고리/설명 텍스트를 한 줄로 합치기.
-    combo_name / name / category / 설명 등 여러 가능성을 고려.
-    """
     pieces = []
 
     for cand in ["combo_name", "name", "콤보이름", "조합명"]:
@@ -230,7 +196,6 @@ def extract_combo_text(row: pd.Series) -> str:
         if cand in row.index and not pd.isna[row.get(cand, None)]:
             pieces.append(str(row[cand]))
 
-    # items 텍스트도 조금 보태기
     items = parse_items_from_row(row)
     if items:
         pieces.append(" + ".join(items))
@@ -263,7 +228,6 @@ def extract_tags_from_combo_text(text: str) -> Set[str]:
     if any(kw in t for kw in _RAINY_KEYWORDS):
         tags.add(TAG_RAINY)
 
-    # 스트레스/우중충이면 위로 태그도 같이
     if TAG_STRESS in tags or TAG_RAINY in tags:
         tags.add(TAG_COMFORT)
 
@@ -276,7 +240,6 @@ def extract_tags_from_combo_text(text: str) -> Set[str]:
 def main():
     print("[build_product_stats] 시작")
 
-    # CU 상품 정규화 맵 로드
     cu_norm_map = load_cu_products()
 
     df_comb = load_combo_df(COMB_PATH)
@@ -295,11 +258,9 @@ def main():
     df_all = pd.concat(all_rows, ignore_index=True)
     print(f"[build_product_stats] combo rows = {len(df_all)}")
 
-    # 상품별 태그 카운트, 상품별 등장 횟수
     product_tag_count: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
     product_count: Dict[str, int] = defaultdict(int)
 
-    # 상품간 co-occurrence 카운트
     coocc: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
 
     matched_combo_rows = 0
@@ -316,13 +277,11 @@ def main():
         combo_text = extract_combo_text(row)
         tags = extract_tags_from_combo_text(combo_text)
 
-        # 상품별 태그 카운트 누적
         for name in matched_items:
             product_count[name] += 1
             for tag in tags:
                 product_tag_count[name][tag] += 1
 
-        # co-occurrence 카운트 (unordered pair)
         unique_items = sorted(set(matched_items))
         for i in range(len(unique_items)):
             for j in range(i + 1, len(unique_items)):
@@ -333,7 +292,6 @@ def main():
 
     print(f"[build_product_stats] matched combo rows = {matched_combo_rows}")
 
-    # product_tags.json 생성 (각 상품별 태그 리스트)
     product_tags: Dict[str, List[str]] = {}
     for name, tag_dict in product_tag_count.items():
         tags_for_product: List[str] = []
@@ -348,7 +306,6 @@ def main():
     with open(PRODUCT_TAGS_PATH, "w", encoding="utf-8") as f:
         json.dump(product_tags, f, ensure_ascii=False, indent=2)
 
-    # product_cooccurrence.json 생성 ({상품: {다른상품: count}})
     trimmed_coocc: Dict[str, Dict[str, int]] = {}
     for name, neighbors in coocc.items():
         sorted_neighbors = sorted(neighbors.items(), key=lambda x: -x[1])[:50]

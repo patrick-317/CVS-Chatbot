@@ -123,29 +123,19 @@ def _build_fail_response(user_text: str) -> Dict[str, Any]:
 # ---------------------------------------------------------
 @router.post("/recommend")
 async def recommend(body: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    카카오 오픈빌더 → 편의점 꿀조합 추천 API
-    사용자의 발화(utterance)를 기반으로
-    1) 유저 선호 파싱
-    2) CSV 기반 RAG 후보 탐색
-    3) product2vec 생성형 후보 생성
-    4) 최종 조합 구성
-    """
+
     user_req = body.get("userRequest") or {}
     utterance = (user_req.get("utterance") or "").strip()
     user_text = utterance or "편의점 꿀조합 추천해줘"
 
-    # (1) 입력 문장에서 선호/제약 파싱
     prefs: UserPreferences = parse_user_preferences(user_text)
 
-    # (2) CSV 기반 RAG 후보
     rag_combos = recommend_combos_openai_rag(
         user_text=user_text,
         top_k=3,
         filters=prefs,
     )
 
-    # (3) product2vec 기반 생성형 조합
     gen_combos = generate_combos_product2vec(
         user_text=user_text,
         base_candidates=rag_combos,
@@ -153,7 +143,6 @@ async def recommend(body: Dict[str, Any]) -> Dict[str, Any]:
         filters=prefs,
     )
 
-    # (4) 최종 후보 합치기
     all_combos = gen_combos + rag_combos
     if not all_combos:
         return _build_fail_response(user_text)

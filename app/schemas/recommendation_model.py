@@ -100,4 +100,4 @@ class HoneyCombo(BaseModel):
     items: List[ComboItem]
     total_price: Optional[int] = None
     mood: Optional[str] = None
-    generated: bool = False  # 딥러닝 생성 여부
+    generated: bool = False
